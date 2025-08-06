@@ -1,3 +1,4 @@
+export const name = "shellyloadbalancer" // ES module only needed for testing with Jest
 const scriptVersion = 1
 // TODO: Check script version on other devices
 console.log("Starting power limiter script version", scriptVersion)
@@ -11,23 +12,24 @@ function exceedsThreshold(compareValue) {
 // Caution: This script uses device names as UIDs; two devices with same name will be seen as one device to this script
 //const deviceName = Shelly.getComponentConfig("System:device:name").replaceAll(" ", "-")
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
-const circuitLimitWatts = 0.8*20*110 // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
+export const circuitLimitWatts = 0.8*20*110 // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
 
 // Map of other plugs' names and their properties
-let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
-let plugDevicesByPriority = new Array(); // Array of Arrays of names
-function updatePlugsByPower() {
-    // Go through each priority's sublist and sort it
+// This should be okay since typical JS environments are single-threaded
+export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
+export let plugDevicesByPriority = new Array(); // Array of Arrays of names
+export function updatePlugsByOnTime() {
+    // Go through each priority's sublist and sort it so the longest-running plugs are first
     plugDevicesByPriority.forEach((nameList) => {
         nameList.sort(plugConsumptionCompareByName)
     });
 };
-function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority) {
+export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority) {
   let newPlug = {
     plugName: plugName,
     timeLastSeen: timeLastSeen,
     powerConsumption: powerConsumption,
-    powerPriority: powerPriority, // Lower number is higher priority.  0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 2 is useful (lighting or tools), 3 is general-purpose, 4 is low priority, 5 is minimum priority (EV charge controller)
+    powerPriority: powerPriority, // Lower number is higher priority.  0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 2 is useful (lighting and tools), 3 is general-purpose, 4 is low priority, 5 is minimum priority (vehicle chargers)
     timeLastCrossedThreshold: timeLastSeen,
     currentlyExceedsThreshold () {
         return exceedsThreshold(powerConsumption)
@@ -50,7 +52,7 @@ function plugConsumptionCompareByName(name1, name2){
     return (plug1consumption - plug2consumption)
 };
 
-function verifyCircuitLoad() {
+export function verifyCircuitLoad() {
     let plugsToDrop = []
     /* Calculate total load, and remove longest-running significant consumption from that load
        until total is under threshold.  */
@@ -107,7 +109,7 @@ function decodeParam(params, paramName, isNumber){
     }
 }
 
-function updatePlugPower(request, response, userdata) {
+export function updatePlugPower(request, response, userdata) {
     // Decode request parameters
     let params = request.query
     let receivedTime = Date()
