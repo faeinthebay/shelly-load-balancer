@@ -5,6 +5,7 @@ console.log("Starting power limiter script version", scriptVersion);
 
 // Constants
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
+const standbyWattsThreshold = 5;
 function exceedsThreshold(compareValue) {
     return compareValue > significantWattsThreshold;
 }
@@ -13,6 +14,7 @@ function exceedsThreshold(compareValue) {
 //const deviceName = Shelly.getComponentConfig("System:device:name").replaceAll(" ", "-")
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
 export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
+const minPriority = 5;
 
 // Map of other plugs' names and their properties
 // JS environments are single-threaded, so thread safety is not needed
@@ -35,25 +37,34 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
     currentlyExceedsThreshold () {
         return exceedsThreshold(powerConsumption);
     },
+    isLoaded () {
+        return powerConsumption > standbyWattsThreshold;
+    },
     updatePower (time, newPower) {
         if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
             this.timeLastCrossedThreshold = time;
         }
-        if(newPower>this.highestConsumption){
+        if(newPower > this.highestConsumption){
             this.highestConsumption = newPower;
         }
         timeLastSeen = time;
         powerConsumption = newPower;
-        // TODO: Also update plugDevicesByName
+        updatePlugsByOnTime();
+    },
+    setPower (powerStatus) {
+        // TODO: Turn plug on or off here
+        return;
     }
   };
   plugDevicesByName.set(plugName, newPlug);
-  plugDevicesByPriority[powerPriority].push(plugName); // TODO: Insert in correct position
+  plugDevicesByPriority[powerPriority].push(plugName);
+  updatePlugsByOnTime();
+  return newPlug;
 };
 function plugOnTimeComparator(name1, name2){
     let plug1 = plugDevicesByName[name1];
     let plug2 = plugDevicesByName[name2];
-    // Significant consumption is always greater, then sub-sort by time
+    // A plug with significant consumption is always greater than a plug with insignificant consumption
     if (plug1.currentlyExceedsThreshold() == plug2.currentlyExceedsThreshold()){
         return (plug1.timeLastCrossedThreshold.getTime() - plug2.timeLastCrossedThreshol.getTime());
     } else if (plug1.currentlyExceedsThreshold()){
@@ -62,6 +73,48 @@ function plugOnTimeComparator(name1, name2){
         return -1;
     }
 };
+function prunePlugs(wattsToPrune){
+    let remainingWatts = wattsToPrune;
+    let plugNamesToPrune = new Array();
+    
+    // Prune lowest priority, lowst consumption plugs first
+    // TODO: Prune longest running plugs first, instead
+    for(let priorityLevel = plugDevicesByPriority.length - 1; priorityLevel >= 0; priorityLevel--) {
+        let plugList = plugDevicesByName[priorityLevel];
+        if (plugList === undefined){
+            // No plugs at this priority level
+            continue;
+        }
+        for(let plugIndex = plugList.length - 1; plugIndex >= 0; plugIndex--){
+            let currentPlugName = plugList[plugIndex];
+            let currentPlug = plugDevicesByName[currentPlugName];
+            if (currentPlug.isLoaded()) {
+                remainingWatts -= currentPlug.powerConsumption;
+                plugNamesToPrune.push(currentPlugName);
+            }
+            if (remainingWatts <= 0) {
+                break;
+            }
+        }
+        if (remainingWatts <= 0) {
+            break;
+        }
+    }
+    // Add back plugs if there's spare capacity
+    // TODO: Break this out so it can reused for enabling plugs arbitrarily
+    // TODO: Instead of list order, add back plugs that have been waiting for the longest time
+    for (let plugIndex = 1; plugIndex < plugNamesToPrune.length; plugIndex++) {
+        let currentPlug = plugDevicesByName[plugNamesToPrune[plugIndex]];
+        if (currentPlug.highestConsumption < -remainingWatts) {
+            plugNamesToPrune.splice(plugIndex, 1);
+            remainingWatts += currentPlug.highestConsumption;
+        }
+    }
+
+    for (const plugName of plugNamesToPrune) {
+        plugDevicesByName[plugName].setPower(false);
+    }
+}
 
 export function verifyCircuitLoad() {
     let plugsToDrop = []
@@ -70,37 +123,17 @@ export function verifyCircuitLoad() {
     // TODO: Consider priority
     console.log("DEBUG: Checking circuit load")
 
-    do {
-        let totalWatts = 0;
-        let oldestPlugName = null;
-        let oldestPlugUpdate = Date();
-
-        for (const [plugName, plugData] of plugDevicesByName) {
-            if (! plugName in plugsToDrop){
-                totalWatts += plugData.powerConsumption;
-
-                if (plugData.timeLastSeen < oldestPlugUpdate && plugData.exceedsThreshold()){
-                    oldestPlugName = plugName;
-                    oldestPlugUpdate = plugData.timeLastSeen;
-                }
-            }
-        }
-
-        if (exceedsThreshold(totalWatts)) {
-            if (oldestPlugName == null){
-                console.log("ERROR: Cannot drop any more plugs even though consumption exceeds limit of", circuitLimitWatts, "; turning off other outlets");
-                break;
-            }
-            plugsToDrop.append(oldestPlugName);
-        }
-    } while (totalWatts > circuitLimitWatts)
-
-    // Turn off plugs over the consumption limit
-    for (plugToDrop of plugsToDrop) {
-        // TODO: Enter consensus with other plugs, then send after 5 seconds
-        console.log("DEBUG: would be dropping plug", plugName);
+    let remainingWatts = circuitLimitWatts;
+    for (const [plugName, plug] of plugDevicesByName){
+        remainingWatts -= plug.powerConsumption;
     }
 
+    // If limit is exceeded, prune plugs, lowest priority first 
+    if (remainingWatts < 0) {
+        prunePlugs(-remainingWatts);
+    }
+
+    // Turn off plugs over the consumption limit
     // TODO: Turn on disabled plugs, from lowest to highest, until limit is met
 }
 
