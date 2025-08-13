@@ -15,21 +15,25 @@ export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of bre
 const minPriority = 5;
 
 // Map of other plugs' names and their properties
-// JS environments are single-threaded, so thread safety is not needed
+// JS environments are single-threaded, so thread safety should not be needed
 export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
-export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first
+export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
 export function updatePlugsByOnTime() {
     // Go through each priority's sublist and sort it
     plugDevicesByPriority.forEach((nameList) => {
-        nameList.sort(plugOnTimeComparator);
+        nameList.sort(plugComparator);
     });
 };
+
 export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority) {
   let newPlug = {
     plugName: plugName,
     timeLastSeen: timeLastSeen,
     powerConsumption: powerConsumption,
-    powerPriority: powerPriority, // Lower number is higher priority.  0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 2 is useful (lighting and tools), 3 is general-purpose, 4 is low priority, 5 is minimum priority (vehicle chargers)
+    powerPriority: powerPriority, /* Lower number is higher priority.  
+    0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
+    2 is useful (lighting and tools), 3 is general-purpose, 
+    4 is low priority, 5 is minimum priority (vehicle chargers) */
     timeLastCrossedThreshold: timeLastSeen,
     highestConsumption: powerConsumption,
     currentlyExceedsThreshold () {
@@ -59,9 +63,34 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
   updatePlugsByOnTime();
   return newPlug;
 };
-function plugOnTimeComparator(name1, name2){
+
+function plugComparator(name1, name2){
     let plug1 = plugDevicesByName[name1];
     let plug2 = plugDevicesByName[name2];
+
+    function getPlugConsumptionTier(plug){
+        // Significant load > insignificant load > no load
+        if(plug.currentlyExceedsThreshold()){
+            return 2;
+        }
+        else if(plug.isLoaded){
+            return 1;
+        }else{
+            return 0;
+        }
+    };
+
+    let plug1ConsumptionTier = getPlugConsumptionTier(plug1);
+    let plug2ConsumptionTier = getPlugConsumptionTier(plug2);
+
+    if (plug1ConsumptionTier == plug2ConsumptionTier){
+        // Within each tier, sort by longest time since toggle
+        return (plug1.timeLastCrossedThreshold - plug2.timeLastCrossedThreshold);
+    } else {
+        return (plug1ConsumptionTier - plug2ConsumptionTier);
+    }
+    
+    /*
     // A plug with significant consumption is always greater than a plug with insignificant consumption
     if (plug1.currentlyExceedsThreshold() == plug2.currentlyExceedsThreshold()){
         return (plug1.timeLastCrossedThreshold.getTime() - plug2.timeLastCrossedThreshol.getTime());
@@ -70,13 +99,15 @@ function plugOnTimeComparator(name1, name2){
     } else {
         return -1;
     }
+        */
 };
+
 function prunePlugs(wattsToPrune){
     let remainingWatts = wattsToPrune;
     let plugNamesToPrune = new Array();
     
     // Prune lowest priority, lowst consumption plugs first
-    // TODO: Prune longest running plugs first, instead
+    // TODO: Instead, prune lowest priority and longest running plugs
     for(let priorityLevel = plugDevicesByPriority.length - 1; priorityLevel >= 0; priorityLevel--) {
         let plugList = plugDevicesByName[priorityLevel];
         if (plugList === undefined){
@@ -184,9 +215,9 @@ export function updatePlugPower(request, response, userdata) {
     // Since there were no errors while decoding data, acknowledge request
     response.code = 200;
     if (!response.send()){
-        console.log("Failed to send 200 response for request", request.query);
+        console.log("ERROR: Failed to send 200 response for request", request.query);
     } else {
-        console.log("Sent 200 response for request", request.query);
+        console.log("DEBUG: Sent 200 response for request", request.query);
     }
 
     // TODO verifyCircuitLoad()
