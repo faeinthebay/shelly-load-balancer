@@ -1,7 +1,5 @@
 export const name = "shellyloadbalancer"; // ES module only needed for testing with Jest
-const scriptVersion = 1;
-// TODO: Check script version on other devices
-console.log("Starting power limiter script version", scriptVersion);
+console.log("Starting power limiter script");
 
 // Constants
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
@@ -114,7 +112,7 @@ function prunePlugs(wattsToPrune){
     for (const plugName of plugNamesToPrune) {
         plugDevicesByName[plugName].setPower(false);
     }
-}
+} 
 
 export function verifyCircuitLoad() {
     let plugsToDrop = []
