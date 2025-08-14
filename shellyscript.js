@@ -15,7 +15,6 @@ export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of bre
 const minPriority = 5;
 
 // Map of other plugs' names and their properties
-// JS environments are single-threaded, so thread safety should not be needed
 export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
 export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
 export function updatePlugsByOnTime() {
@@ -25,12 +24,14 @@ export function updatePlugsByOnTime() {
     });
 };
 
+const isLeader = true; // TODO: Track which plug is first online and make it the "leader" while other plugs are the "followers"
+
 export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority) {
   let newPlug = {
     plugName: plugName,
     timeLastSeen: timeLastSeen,
     powerConsumption: powerConsumption,
-    powerPriority: powerPriority, /* Lower number is higher priority.  
+    powerPriority: powerPriority, /* Lower number is higher priority.  Cannot be changed after plug created.  
     0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
     2 is useful (lighting and tools), 3 is general-purpose, 
     4 is low priority, 5 is minimum priority (vehicle chargers) */
@@ -55,6 +56,7 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
     },
     setPower (powerStatus) {
         // TODO: Turn plug on or off here
+        // TODO: Make this async, or use a tight timeout
         return;
     }
   };
@@ -68,7 +70,7 @@ function plugComparator(name1, name2){
     let plug1 = plugDevicesByName[name1];
     let plug2 = plugDevicesByName[name2];
 
-    function getPlugConsumptionTier(plug){
+    function determinePlugConsumptionTier(plug){
         // Significant load > insignificant load > no load
         if(plug.currentlyExceedsThreshold()){
             return 2;
@@ -80,8 +82,8 @@ function plugComparator(name1, name2){
         }
     };
 
-    let plug1ConsumptionTier = getPlugConsumptionTier(plug1);
-    let plug2ConsumptionTier = getPlugConsumptionTier(plug2);
+    let plug1ConsumptionTier = determinePlugConsumptionTier(plug1);
+    let plug2ConsumptionTier = determinePlugConsumptionTier(plug2);
 
     if (plug1ConsumptionTier == plug2ConsumptionTier){
         // Within each tier, sort by longest time since toggle
@@ -89,37 +91,27 @@ function plugComparator(name1, name2){
     } else {
         return (plug1ConsumptionTier - plug2ConsumptionTier);
     }
-    
-    /*
-    // A plug with significant consumption is always greater than a plug with insignificant consumption
-    if (plug1.currentlyExceedsThreshold() == plug2.currentlyExceedsThreshold()){
-        return (plug1.timeLastCrossedThreshold.getTime() - plug2.timeLastCrossedThreshol.getTime());
-    } else if (plug1.currentlyExceedsThreshold()){
-        return 1;
-    } else {
-        return -1;
-    }
-        */
 };
 
-function prunePlugs(wattsToPrune){
-    let remainingWatts = wattsToPrune;
-    let plugNamesToPrune = new Array();
+/* A lock is not necessary because Espruino should allow functions to finish before handling a new event
+*/
+// TODO: Make this a general-purpose rebalance function, which could automatically add plugs back if load goes down
+function shedPlugs(wattsToShed){
+    let remainingWatts = wattsToShed;
+    let plugNamesToShed = new Array();
     
-    // Prune lowest priority, lowst consumption plugs first
-    // TODO: Instead, prune lowest priority and longest running plugs
+    // Shed lowest priority plugs first
     for(let priorityLevel = plugDevicesByPriority.length - 1; priorityLevel >= 0; priorityLevel--) {
         let plugList = plugDevicesByName[priorityLevel];
         if (plugList === undefined){
             // No plugs at this priority level
             continue;
         }
-        for(let plugIndex = plugList.length - 1; plugIndex >= 0; plugIndex--){
-            let currentPlugName = plugList[plugIndex];
+        for(const currentPlugName of plugList){
             let currentPlug = plugDevicesByName[currentPlugName];
             if (currentPlug.isLoaded()) {
                 remainingWatts -= currentPlug.powerConsumption;
-                plugNamesToPrune.push(currentPlugName);
+                plugNamesToShed.unshift(currentPlugName);
             }
             if (remainingWatts <= 0) {
                 break;
@@ -129,18 +121,21 @@ function prunePlugs(wattsToPrune){
             break;
         }
     }
-    // Add back plugs if there's spare capacity
+
+    /* Keep plugs online if there's spare capacity.
+       The first iteration will never add back the most recent plug, but the code is more readable this way.
+    */
     // TODO: Break this out so it can reused for enabling plugs arbitrarily
-    // TODO: Instead of list order, add back plugs that have been waiting for the longest time
-    for (let plugIndex = 1; plugIndex < plugNamesToPrune.length; plugIndex++) {
-        let currentPlug = plugDevicesByName[plugNamesToPrune[plugIndex]];
+    for (const currentPlugName of plugNamesToShed) {
+        let currentPlug = plugDevicesByName[currentPlugName];
         if (currentPlug.highestConsumption < -remainingWatts) {
-            plugNamesToPrune.splice(plugIndex, 1);
+            plugNamesToShed.splice(plugIndex, 1);
             remainingWatts += currentPlug.highestConsumption;
         }
     }
 
-    for (const plugName of plugNamesToPrune) {
+    // Shed plugs
+    for (const plugName of plugNamesToShed) {
         plugDevicesByName[plugName].setPower(false);
     }
 } 
@@ -149,7 +144,6 @@ export function verifyCircuitLoad() {
     let plugsToDrop = []
     /* Calculate total load, and remove longest-running significant consumption from that load
        until total is under threshold.  */
-    // TODO: Consider priority
     console.log("DEBUG: Checking circuit load")
 
     let remainingWatts = circuitLimitWatts;
@@ -157,9 +151,8 @@ export function verifyCircuitLoad() {
         remainingWatts -= plug.powerConsumption;
     }
 
-    // If limit is exceeded, prune plugs, lowest priority first 
     if (remainingWatts < 0) {
-        prunePlugs(-remainingWatts);
+        shedPlugs(-remainingWatts);
     }
 
     // Turn off plugs over the consumption limit
@@ -195,16 +188,17 @@ export function updatePlugPower(request, response, userdata) {
     // Respond with "bad request" error if params are not as expected
     if (senderName == null || isNaN(newPowerValue) || isNaN(senderPriority)) {
         response.code = 400;
-        if (!response.send()){
-            console.log("Failed to send 400 response for request", params);
-        }
-        console.log("DEBUG: Issue decoding params");
-        return;
-    }else{
-        console.log("DEBUG: Params decoded without issue");
+    } else {
+        response.code = 200;
     }
 
-    // Update or create corresponding plug object with new values
+    if (!response.send()){
+        console.log("Failed to send response for request", params, "with status", response.code);
+    }else{
+        console.log("DEBUG: Sent response for request", params, "with status", response.code);
+    }
+
+    // TODO: Update or create corresponding plug object with new values
     // TODO: Update from map to nested arrays
     /*if (!plugDevicesByName.has(senderName)){
         createPlug(senderName, receivedTime, newPowerValue, senderPriority)
@@ -212,15 +206,9 @@ export function updatePlugPower(request, response, userdata) {
         plugDevicesByName.get(senderName).updatePower(receivedTime, newPowerValue)
     }*/
 
-    // Since there were no errors while decoding data, acknowledge request
-    response.code = 200;
-    if (!response.send()){
-        console.log("ERROR: Failed to send 200 response for request", request.query);
-    } else {
-        console.log("DEBUG: Sent 200 response for request", request.query);
+    if(isLeader){
+        verifyCircuitLoad();
     }
-
-    // TODO verifyCircuitLoad()
 }
 
 let powerHandlerURL = HTTPServer.registerEndpoint("updatePlugPower", updatePlugPower);
