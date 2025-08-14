@@ -1,3 +1,8 @@
+/*  This is a load balancer script for Shelly Plugs written in Shelly Script.
+    Shelly Script is an implementation of Espruino, a subset of Javascript for embedded devices.
+    This script runs on multiple smart plugs with different priority levels, 
+    disabling plugs with lower priorities when the circuit is being overloaded.
+*/
 export const name = "shellyloadbalancer"; // ES module only needed for testing with Jest
 console.log("Starting power limiter script");
 
@@ -36,7 +41,7 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
     2 is useful (lighting and tools), 3 is general-purpose, 
     4 is low priority, 5 is minimum priority (vehicle chargers) */
     timeLastCrossedThreshold: timeLastSeen,
-    highestConsumption: powerConsumption,
+    highestConsumption: powerConsumption, // TODO: Allow plugs to declare varible load (like an inverter A/C or multi-step heater), so this variable can be ignored, hard-coded, or slowly fall to a current value if that value is above the "significant load" threshold
     currentlyExceedsThreshold () {
         return exceedsThreshold(powerConsumption);
     },
@@ -93,25 +98,29 @@ function plugComparator(name1, name2){
     }
 };
 
-/* A lock is not necessary because Espruino should allow functions to finish before handling a new event
+/*  Determines plugs to disable or reenable to keep the circuit as close to its maximum as possible.
+    A lock is not necessary because Espruino should allow functions to finish before handling a new event
 */
-// TODO: Make this a general-purpose rebalance function, which could automatically add plugs back if load goes down
-function shedPlugs(wattsToShed){
-    let remainingWatts = wattsToShed;
-    let plugNamesToShed = new Array();
+function rebalancePlugs(wattsToAdd){
+    let remainingWatts = Math.abs(wattsToAdd);
+    let plugNamesToToggle = new Array();
+    let desiredPlugStatus = (wattsToAdd > 0); // Will be false if shedding, since plugs will be turned off
     
-    // Shed lowest priority plugs first
-    for(let priorityLevel = plugDevicesByPriority.length - 1; priorityLevel >= 0; priorityLevel--) {
+    // Try to keep highest priority plugs powered on, so when shedding, start at lowest priority
+    let priorityLevel = desiredPlugStatus ? 0 : plugDevicesByPriority.length - 1;
+    let priorityChangePerLoop = desiredPlugStatus ? 1 : -1;
+    for(; priorityLevel >= 0 && priorityLevel < plugDevicesByPriority.length; priorityLevel+=priorityChangePerLoop) {
         let plugList = plugDevicesByName[priorityLevel];
         if (plugList === undefined){
             // No plugs at this priority level
             continue;
         }
         for(const currentPlugName of plugList){
+            // TODO: Rewrite this for-loop to handle reenabling plugs, since we need to compare each plug's maximum consumption, and will skip adding any plugs that go over the limit.
             let currentPlug = plugDevicesByName[currentPlugName];
             if (currentPlug.isLoaded()) {
                 remainingWatts -= currentPlug.powerConsumption;
-                plugNamesToShed.unshift(currentPlugName);
+                plugNamesToToggle.unshift(currentPlugName);
             }
             if (remainingWatts <= 0) {
                 break;
@@ -122,21 +131,22 @@ function shedPlugs(wattsToShed){
         }
     }
 
-    /* Keep plugs online if there's spare capacity.
+    /* Keep plugs online/offline if there is spare capacity to add back.
        The first iteration will never add back the most recent plug, but the code is more readable this way.
     */
-    // TODO: Break this out so it can reused for enabling plugs arbitrarily
-    for (const currentPlugName of plugNamesToShed) {
+    // TODO: Skip this if reenabling plugs since we don't want to consider passing over a large high-priority load to reenable a small low-priority load  
+    for (const currentPlugName of plugNamesToToggle) {
         let currentPlug = plugDevicesByName[currentPlugName];
         if (currentPlug.highestConsumption < -remainingWatts) {
-            plugNamesToShed.splice(plugIndex, 1);
+            plugNamesToToggle.splice(plugIndex, 1);
             remainingWatts += currentPlug.highestConsumption;
         }
     }
 
-    // Shed plugs
-    for (const plugName of plugNamesToShed) {
-        plugDevicesByName[plugName].setPower(false);
+    // Toggle plugs
+    for (const plugName of plugNamesToToggle) {
+        console.log("Toggling plug", plugName, "to", desiredPlugStatus);
+        plugDevicesByName[plugName].setPower(desiredPlugStatus);
     }
 } 
 
@@ -151,13 +161,11 @@ export function verifyCircuitLoad() {
         remainingWatts -= plug.powerConsumption;
     }
 
-    if (remainingWatts < 0) {
-        shedPlugs(-remainingWatts);
-    }
+    console.log("DEBUG: Circuit has spare capacity of", remainingWatts, "watts from a total of", circuitLimitWatts);
 
-    // Turn off plugs over the consumption limit
-    // TODO: Turn on disabled plugs, from lowest to highest, until limit is met
-}
+    if (remainingWatts < 0) {
+        rebalancePlugs(remainingWatts);
+    }}
 
 function decodeParam(params, paramName, isNumber){
     let startIndex = params.indexOf(paramName + "=") + paramName.length + 1;
@@ -199,6 +207,7 @@ export function updatePlugPower(request, response, userdata) {
     }
 
     // TODO: Update or create corresponding plug object with new values
+    // TODO: Panic if plug has load of more than 5 watts but is toggled off
     // TODO: Update from map to nested arrays
     /*if (!plugDevicesByName.has(senderName)){
         createPlug(senderName, receivedTime, newPowerValue, senderPriority)
