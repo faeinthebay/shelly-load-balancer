@@ -18,6 +18,8 @@ function exceedsThreshold(compareValue) {
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
 export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
 const minPriority = 5;
+const globalUsername = "peppermint";
+const globalPassword = "Sysssadm1n!";
 
 // Map of other plugs' names and their properties
 export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
@@ -31,7 +33,12 @@ export function updatePlugsByOnTime() {
 
 const isLeader = true; // TODO: Track which plug is first online and make it the "leader" while other plugs are the "followers"
 
-export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority) {
+function buildPlugURL(plugName, path){
+    return "http://" + plugName + ".local/" + path;
+}
+
+// TODO: Add self to list
+export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority, isSelf) {
   let newPlug = {
     plugName: plugName,
     timeLastSeen: timeLastSeen,
@@ -42,6 +49,7 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
     4 is low priority, 5 is minimum priority (vehicle chargers) */
     timeLastCrossedThreshold: timeLastSeen,
     highestConsumption: powerConsumption, // TODO: Allow plugs to declare varible load (like an inverter A/C or multi-step heater), so this variable can be ignored, hard-coded, or slowly fall to a current value if that value is above the "significant load" threshold
+    isSelf: isSelf,
     currentlyExceedsThreshold () {
         return exceedsThreshold(powerConsumption);
     },
@@ -60,8 +68,10 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
         updatePlugsByOnTime();
     },
     setPower (powerStatus) {
-        // TODO: Turn plug on or off here
-        // TODO: Make this async, or use a tight timeout
+        let desiredStatus = powerStatus ? "on" : "off";
+        // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
+        let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
+        // TODO: Check response and retry if error https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
         return;
     }
   };
@@ -98,8 +108,9 @@ function plugComparator(name1, name2){
     }
 };
 
-/*  Determines plugs to disable or reenable to keep the circuit as close to its maximum as possible.
-    A lock is not necessary because Espruino should allow functions to finish before handling a new event
+/*  
+    Determines plugs to disable or reenable to keep the circuit as close to its maximum as possible.
+    A lock is not necessary because Espruino should allow functions to finish before handling a new event.
 */
 function rebalancePlugs(wattsToAdd){
     let remainingWatts = Math.abs(wattsToAdd);
@@ -131,15 +142,21 @@ function rebalancePlugs(wattsToAdd){
         }
     }
 
-    /* Keep plugs online/offline if there is spare capacity to add back.
-       The first iteration will never add back the most recent plug, but the code is more readable this way.
+    /* 
+        We have now dropped enough plugs to stay under the circuit capacity.
+        The most recent plug candidate might have dropped more load than necessary, 
+        so check if there are small plugs to keep online.
+        The first loop iteration will never add back the last plug, but the loop is more readable this way.
+        When reenabling plugs, we stop before going over capacity (and 
+        don't want to drop a higher priority plug that is further down the list), so this pass is skipped.
     */
-    // TODO: Skip this if reenabling plugs since we don't want to consider passing over a large high-priority load to reenable a small low-priority load  
-    for (const currentPlugName of plugNamesToToggle) {
-        let currentPlug = plugDevicesByName[currentPlugName];
-        if (currentPlug.highestConsumption < -remainingWatts) {
-            plugNamesToToggle.splice(plugIndex, 1);
-            remainingWatts += currentPlug.highestConsumption;
+    if(desiredPlugStatus){
+        for (const currentPlugName of plugNamesToToggle) {
+            let currentPlug = plugDevicesByName[currentPlugName];
+            if (currentPlug.highestConsumption < -remainingWatts) {
+                plugNamesToToggle.splice(plugIndex, 1);
+                remainingWatts += currentPlug.highestConsumption;
+            }
         }
     }
 
@@ -148,7 +165,7 @@ function rebalancePlugs(wattsToAdd){
         console.log("Toggling plug", plugName, "to", desiredPlugStatus);
         plugDevicesByName[plugName].setPower(desiredPlugStatus);
     }
-} 
+}
 
 export function verifyCircuitLoad() {
     let plugsToDrop = []
@@ -210,7 +227,7 @@ export function updatePlugPower(request, response, userdata) {
     // TODO: Panic if plug has load of more than 5 watts but is toggled off
     // TODO: Update from map to nested arrays
     /*if (!plugDevicesByName.has(senderName)){
-        createPlug(senderName, receivedTime, newPowerValue, senderPriority)
+        createPlug(senderName, receivedTime, newPowerValue, senderPriority, false)
     } else {
         plugDevicesByName.get(senderName).updatePower(receivedTime, newPowerValue)
     }*/
@@ -222,8 +239,9 @@ export function updatePlugPower(request, response, userdata) {
 
 let powerHandlerURL = HTTPServer.registerEndpoint("updatePlugPower", updatePlugPower);
 // Full URL will look like: http://Shelly-Plug.local/script/1/updatePlugPower?sender=OtherPlug&value=100&priority=1
-// Each plug should update all plugs including itself, and all updates should wait 1 second for inrush current to stabilize
-// TODO: Consider sending updates ever minute as a heartbeat, so that offline plugs can be pruned from list
+// Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
+// TODO: All updates should wait 1 second for inrush current to stabilize
+// TODO: Sending updates ever minute as a heartbeat, so that offline plugs can be pruned from list
+// TODO: Send updates to other plugs from this script, instead of via Shelly GUI
 
 console.log("Registered power update handler at", powerHandlerURL);
-// TODO: Do I need to query other devices' Shelly Scripting local APIs for the script ID, or is it predicatable?
