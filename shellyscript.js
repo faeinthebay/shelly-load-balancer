@@ -1,19 +1,26 @@
 /*  This is a load balancer script for Shelly Plugs written in Shelly Script.
     Shelly Script is an implementation of Espruino, a subset of Javascript for embedded devices.
     This script runs on multiple smart plugs with different priority levels, 
-    disabling plugs with lower priorities when the circuit is being overloaded.
+    preventing the circuit is being overloaded and prioritizing high priority plugs.
+    Caution: High current loads through consumer-grade smart plugs can damage them over time!
 */
-export const name = "shellyloadbalancer"; // ES module only needed for testing with Jest
-console.log("Starting power limiter script");
+export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
+console.log("Starting power load balancer script");
 
-// Constants
+/*  Constants
+    Watts are used because they are the default measurement unit for Shelly plugs, 
+    and allow consistent logic when there is fluctuating voltage.
+*/
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
 const standbyWattsThreshold = 5;
 function exceedsThreshold(compareValue) {
     return compareValue > significantWattsThreshold;
 }
-// TODO: Find a way to get hostname or replicate transforming device name into hostname
-// Caution: This script uses device names as UIDs; two devices with same name will be seen as one device to this script
+/*
+    Caution: This script uses device names as UIDs, so two devices with same name
+             will be seen as one device to this script.
+    To be safe, name devices only with alphanumerics and hyphens ([a-z0-9\-]+), NO SPACES!
+    */
 //const deviceName = Shelly.getComponentConfig("System:device:name").replaceAll(" ", "-")
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
 export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
@@ -22,6 +29,8 @@ const globalUsername = "peppermint";
 const globalPassword = "Sysssadm1n!";
 
 // Map of other plugs' names and their properties
+const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declare in script instead of KVS to avoid character limit
+// TODO: Verify this device is in knownPlugNames
 export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
 export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
 export function updatePlugsByOnTime() {
@@ -45,15 +54,15 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
     powerConsumption: powerConsumption,
     powerPriority: powerPriority, /* Lower number is higher priority.  Cannot be changed after plug created.  
     0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
-    2 is useful (lighting and tools), 3 is general-purpose, 
-    4 is low priority, 5 is minimum priority (vehicle chargers) */
+    2 is useful (lighting/tools/appliances/desktop computer), 3 is general-purpose (laptop charger/important air conditioner), 
+    4 is low priority (heated blanket/less important air conditioner), 5 is minimum priority (vehicle chargers) */
     timeLastCrossedThreshold: timeLastSeen,
-    highestConsumption: powerConsumption, // TODO: Allow plugs to declare varible load (like an inverter A/C or multi-step heater), so this variable can be ignored, hard-coded, or slowly fall to a current value if that value is above the "significant load" threshold
+    highestConsumption: powerConsumption, // TODO: Allow plugs to declare varible load (like an inverter A/C, multi-step heater, or shared between multiple devices), so this variable can be ignored, hard-coded, or slowly fall to the present value if that value is above the "significant load" threshold
     isSelf: isSelf,
     currentlyExceedsThreshold () {
         return exceedsThreshold(powerConsumption);
     },
-    isLoaded () {
+    isLoaded () { // TODO: Stop using this as indicator if plug is enabled, and instead track actual relay status.  Panic if a disabled plug appears loaded 5 seconds after switching off.
         return powerConsumption > standbyWattsThreshold;
     },
     updatePower (time, newPower) {
@@ -71,7 +80,7 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
         let desiredStatus = powerStatus ? "on" : "off";
         // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
         let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
-        // TODO: Check response and retry if error https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
+        // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
         return;
     }
   };
@@ -81,6 +90,7 @@ export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriori
   return newPlug;
 };
 
+// Compares plugs for sorting.  Assumes all plugs are the same priority.  
 function plugComparator(name1, name2){
     let plug1 = plugDevicesByName[name1];
     let plug2 = plugDevicesByName[name2];
@@ -90,7 +100,7 @@ function plugComparator(name1, name2){
         if(plug.currentlyExceedsThreshold()){
             return 2;
         }
-        else if(plug.isLoaded){
+        else if(plug.isLoaded()){
             return 1;
         }else{
             return 0;
@@ -101,7 +111,8 @@ function plugComparator(name1, name2){
     let plug2ConsumptionTier = determinePlugConsumptionTier(plug2);
 
     if (plug1ConsumptionTier == plug2ConsumptionTier){
-        // Within each tier, sort by longest time since toggle
+        // Within each tier, sort by longest time since toggle, e.g.
+        // On long time > on short time > off long time > off short time
         return (plug1.timeLastCrossedThreshold - plug2.timeLastCrossedThreshold);
     } else {
         return (plug1ConsumptionTier - plug2ConsumptionTier);
@@ -109,7 +120,8 @@ function plugComparator(name1, name2){
 };
 
 /*  
-    Determines plugs to disable or reenable to keep the circuit as close to its maximum as possible.
+    Determines plugs to disable (shed) or to reenable, 
+    allowing us to keep the circuit as close to its maximum as possible.
     A lock is not necessary because Espruino should allow functions to finish before handling a new event.
 */
 function rebalancePlugs(wattsToAdd){
@@ -117,7 +129,11 @@ function rebalancePlugs(wattsToAdd){
     let plugNamesToToggle = new Array();
     let desiredPlugStatus = (wattsToAdd > 0); // Will be false if shedding, since plugs will be turned off
     
-    // Try to keep highest priority plugs powered on, so when shedding, start at lowest priority
+    /*
+        Try to keep highest priority plugs powered on.
+        So when shedding, drop lowest priority plugs first.
+        And when reenabling, start with highest priority plugs first.
+    */
     let priorityLevel = desiredPlugStatus ? 0 : plugDevicesByPriority.length - 1;
     let priorityChangePerLoop = desiredPlugStatus ? 1 : -1;
     for(; priorityLevel >= 0 && priorityLevel < plugDevicesByPriority.length; priorityLevel+=priorityChangePerLoop) {
@@ -127,28 +143,35 @@ function rebalancePlugs(wattsToAdd){
             continue;
         }
         for(const currentPlugName of plugList){
-            // TODO: Rewrite this for-loop to handle reenabling plugs, since we need to compare each plug's maximum consumption, and will skip adding any plugs that go over the limit.
             let currentPlug = plugDevicesByName[currentPlugName];
-            if (currentPlug.isLoaded()) {
-                remainingWatts -= currentPlug.powerConsumption;
-                plugNamesToToggle.unshift(currentPlugName);
-            }
-            if (remainingWatts <= 0) {
-                break;
+            if (!desiredPlugStatus){ // Shedding plugs, so look at present current consumption
+                if (currentPlug.isLoaded()) {
+                    remainingWatts -= currentPlug.powerConsumption;
+                    plugNamesToToggle.unshift(currentPlugName);
+                }
+                if (remainingWatts <= 0) {
+                    break;
+                }
+            } else { // Reenabling plugs, so try to power everything in this priority tier first before continuing down.  Use maximum current consumption to avoid overloading circuit in a few seconds.
+                if(currentPlug.isLoaded() && currentPlug.highestConsumption <= remainingWatts){
+                    remainingWatts -= currentPlug.highestConsumption;
+                    plugNamesToToggle.push(currentPlugName);
+                }
             }
         }
-        if (remainingWatts <= 0) {
+        if (!desiredPlugStatus && remainingWatts <= 0) {
             break;
         }
+        // Don't break early when reenabling plugs, as there is always a change another small load can be reenabled
     }
 
     /* 
-        We have now dropped enough plugs to stay under the circuit capacity.
+        If dropping plugs, we are now under the circuit capacity.
         The most recent plug candidate might have dropped more load than necessary, 
-        so check if there are small plugs to keep online.
+        so check if there are small loads to keep online.
         The first loop iteration will never add back the last plug, but the loop is more readable this way.
-        When reenabling plugs, we stop before going over capacity (and 
-        don't want to drop a higher priority plug that is further down the list), so this pass is skipped.
+        When reenabling plugs, we stop before going over capacity
+        (and don't want to drop a higher priority plug that is further down the list), so this pass is skipped.
     */
     if(desiredPlugStatus){
         for (const currentPlugName of plugNamesToToggle) {
@@ -223,9 +246,7 @@ export function updatePlugPower(request, response, userdata) {
         console.log("DEBUG: Sent response for request", params, "with status", response.code);
     }
 
-    // TODO: Update or create corresponding plug object with new values
-    // TODO: Panic if plug has load of more than 5 watts but is toggled off
-    // TODO: Update from map to nested arrays
+    // TODO
     /*if (!plugDevicesByName.has(senderName)){
         createPlug(senderName, receivedTime, newPowerValue, senderPriority, false)
     } else {
@@ -242,6 +263,6 @@ let powerHandlerURL = HTTPServer.registerEndpoint("updatePlugPower", updatePlugP
 // Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
 // TODO: All updates should wait 1 second for inrush current to stabilize
 // TODO: Sending updates ever minute as a heartbeat, so that offline plugs can be pruned from list
-// TODO: Send updates to other plugs from this script, instead of via Shelly GUI
+// TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
 
 console.log("Registered power update handler at", powerHandlerURL);
