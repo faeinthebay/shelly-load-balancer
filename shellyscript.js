@@ -13,6 +13,7 @@ console.log("Starting power load balancer script");
 */
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
 const standbyWattsThreshold = 5;
+const minutesPowerHistory = 5;
 function exceedsThreshold(compareValue) {
     return compareValue > significantWattsThreshold;
 }
@@ -31,7 +32,7 @@ const globalPassword = "Sysssadm1n!";
 // Map of other plugs' names and their properties
 const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declare in script instead of KVS to avoid character limit
 // TODO: Verify this device is in knownPlugNames
-export let plugDevicesByName = new Map(); // TODO: Verify this still works instead of const = {}
+export let plugDevicesByName = new Map();
 export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
 export function updatePlugsByOnTime() {
     // Go through each priority's sublist and sort it
@@ -40,54 +41,90 @@ export function updatePlugsByOnTime() {
     });
 };
 
-const isLeader = true; // TODO: Track which plug is first online and make it the "leader" while other plugs are the "followers"
+const isLeader = true; // TODO: Plug that's online the longest should be the "leader" while other plugs are the "followers"
 
 function buildPlugURL(plugName, path){
     return "http://" + plugName + ".local/" + path;
 }
 
 // TODO: Add self to list
-export function createPlug(plugName, timeLastSeen, powerConsumption, powerPriority, isSelf) {
-  let newPlug = {
-    plugName: plugName,
-    timeLastSeen: timeLastSeen,
-    powerConsumption: powerConsumption,
-    powerPriority: powerPriority, /* Lower number is higher priority.  Cannot be changed after plug created.  
-    0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
-    2 is useful (lighting/tools/appliances/desktop computer), 3 is general-purpose (laptop charger/important air conditioner), 
-    4 is low priority (heated blanket/less important air conditioner), 5 is minimum priority (vehicle chargers) */
-    timeLastCrossedThreshold: timeLastSeen,
-    highestConsumption: powerConsumption, // TODO: Allow plugs to declare varible load (like an inverter A/C, multi-step heater, or shared between multiple devices), so this variable can be ignored, hard-coded, or slowly fall to the present value if that value is above the "significant load" threshold
-    isSelf: isSelf,
-    currentlyExceedsThreshold () {
-        return exceedsThreshold(powerConsumption);
-    },
-    isLoaded () { // TODO: Stop using this as indicator if plug is enabled, and instead track actual relay status.  Panic if a disabled plug appears loaded 5 seconds after switching off.
-        return powerConsumption > standbyWattsThreshold;
-    },
-    updatePower (time, newPower) {
-        if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
-            this.timeLastCrossedThreshold = time;
+export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powerPriority, isSelf) {
+    let newPlug = {
+        plugName: plugName,
+        timeLastSeen: timeLastSeen,
+        timeFirstSeen: timeLastSeen,
+        /* A recent history of power consumptions at given times, up to minutesPowerHistory.
+           Should be in chronological order since plugs only send their own updates, 
+           and an update-sender should block further execution. 
+        */
+        powerConsumption: new Map([timeLastSeen, presentPowerConsumption]),
+        powerPriority: powerPriority, /* Lower number is higher priority.
+        0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
+        2 is useful (lighting/tools/appliances/desktop computer), 3 is general-purpose (laptop charger/air conditioner in occupied room), 
+        4 is low priority (heated blanket/air conditioner in unoccupied room), 5 is minimum priority (vehicle chargers) */
+        timeLastCrossedThreshold: timeLastSeen,
+        highestConsumption: presentPowerConsumption,
+        isSelf: isSelf,
+        currentlyExceedsThreshold () {
+            return exceedsThreshold(powerConsumption);
+        },
+        isLoaded () { // TODO: Stop using this as indicator if plug is enabled, and instead track actual relay status.  Panic if a disabled plug stays loaded 5 seconds after switching off.
+            return powerConsumption[timeLastSeen] > standbyWattsThreshold;
+        },
+        updatePower (time, newPower) {
+            if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
+                this.timeLastCrossedThreshold = time;
+            }
+            if(newPower > this.highestConsumption){
+                this.highestConsumption = newPower;
+                // TODO: Reset highest consumption after 24 hours below significant threshold
+            }
+            timeLastSeen = time;
+
+            this.powerConsumption.set(time, newPower);
+            // Prune consumption history outside of window
+            let timeCutoff = new Date(new Date() - minutesPowerHistory*60*1000);
+            for (const [time, consumption] of this.powerConsumption) {
+                if (time < timeCutoff){
+                    this.powerConsumption.delete(time);
+                }else{
+                    // All further times are within the history window
+                    break;
+                }
+            }
+
+            updatePlugsByOnTime();
+        },
+        setPower (powerStatus) {
+            let desiredStatus = powerStatus ? "on" : "off";
+            // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
+            let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
+            // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
+            return;
+        },
+        /*  Averages power consumption, weighted with exponential decay, perhaps 1/(2^(x+1)).  
+            TODO: We need to compensate for the uneven distribution of consumption, 
+            since weights won't usually add up to 1.
+        */
+        averageRecentConsumption () {
+            let lastTime = null;
+            let runningTotal = 0;
+            for (const [time, consumption] of this.powerConsumption){
+                if(lastTime != null){
+                    let minutesAgo = (new Date() - time)/1000;
+                    let minutesPeriod = (time - lastTime)/1000;
+                    let consumptionWattMinutes = consumption*(Math.pow(2, minutesAgo + 1));
+                    runningTotal += consumptionWattMinutes * minutesPeriod;
+                }
+                lastTime = time;
+            }
+            // TODO
         }
-        if(newPower > this.highestConsumption){
-            this.highestConsumption = newPower;
-        }
-        timeLastSeen = time;
-        powerConsumption = newPower;
-        updatePlugsByOnTime();
-    },
-    setPower (powerStatus) {
-        let desiredStatus = powerStatus ? "on" : "off";
-        // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
-        let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
-        // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
-        return;
-    }
-  };
-  plugDevicesByName.set(plugName, newPlug);
-  plugDevicesByPriority[powerPriority].push(plugName);
-  updatePlugsByOnTime();
-  return newPlug;
+    };
+    plugDevicesByName.set(plugName, newPlug);
+    plugDevicesByPriority[powerPriority].push(plugName);
+    updatePlugsByOnTime();
+    return newPlug;
 };
 
 // Compares plugs for sorting.  Assumes all plugs are the same priority.  
