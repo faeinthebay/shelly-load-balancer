@@ -6,6 +6,7 @@
 */
 export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
 console.log("Starting power load balancer script");
+// TODO: Apparently Espruino treats "let" as "var", so check there are no scope collisions
 
 /*  Constants
     Watts are used because they are the default measurement unit for Shelly plugs, 
@@ -13,6 +14,7 @@ console.log("Starting power load balancer script");
 */
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
 const standbyWattsThreshold = 5;
+const significantWattChange = 5; // Watts difference that is ignored
 const minutesPowerHistory = 5;
 function exceedsThreshold(compareValue) {
     return compareValue > significantWattsThreshold;
@@ -29,11 +31,12 @@ const minPriority = 5;
 const globalUsername = "peppermint";
 const globalPassword = "Sysssadm1n!";
 
-// Map of other plugs' names and their properties
-const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declare in script instead of KVS to avoid character limit
-// TODO: Verify this device is in knownPlugNames
-export let plugDevicesByName = new Map();
-export let plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
+// Map of plugs' mDNS names and their properties
+export var plugDevicesByName = new Map();
+export var plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
+// User needs to include this plug in  list of plug names
+const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declared in script instead of KVS to avoid character limit
+var selfPlug = null;
 export function updatePlugsByOnTime() {
     // Go through each priority's sublist and sort it
     plugDevicesByPriority.forEach((nameList) => {
@@ -41,14 +44,14 @@ export function updatePlugsByOnTime() {
     });
 };
 
-const isLeader = true; // TODO: Plug that's online the longest should be the "leader" while other plugs are the "followers"
+const isLeader = true; // TODO: Plug that's online the longest should become the "leader" while other plugs are the "followers"
 
 function buildPlugURL(plugName, path){
     return "http://" + plugName + ".local/" + path;
 }
 
 // TODO: Add self to list
-export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powerPriority, isSelf) {
+export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powerPriority, isCircuitClosed, isSelf) {
     let newPlug = {
         plugName: plugName,
         timeLastSeen: timeLastSeen,
@@ -58,6 +61,8 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
            and an update-sender should block further execution. 
         */
         powerConsumption: new Map([timeLastSeen, presentPowerConsumption]),
+        lastUpdated: timeLastSeen,
+        averageRecentConsumption: NaN,
         powerPriority: powerPriority, /* Lower number is higher priority.
         0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
         2 is useful (lighting/tools/appliances/desktop computer), 3 is general-purpose (laptop charger/air conditioner in occupied room), 
@@ -65,13 +70,14 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
         timeLastCrossedThreshold: timeLastSeen,
         highestConsumption: presentPowerConsumption,
         isSelf: isSelf,
+        isCircuitClosed: isCircuitClosed,
         currentlyExceedsThreshold () {
             return exceedsThreshold(powerConsumption);
         },
-        isLoaded () { // TODO: Stop using this as indicator if plug is enabled, and instead track actual relay status.  Panic if a disabled plug stays loaded 5 seconds after switching off.
-            return powerConsumption[timeLastSeen] > standbyWattsThreshold;
-        },
         updatePower (time, newPower) {
+            if(Math.abs(newPower - getRecentConsumption()) < 5){
+                return;
+            }
             if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
                 this.timeLastCrossedThreshold = time;
             }
@@ -93,37 +99,48 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                 }
             }
 
+            this.averageRecentConsumption();
             updatePlugsByOnTime();
         },
         setPower (powerStatus) {
+            // TODO: don't use HTTP for self
             let desiredStatus = powerStatus ? "on" : "off";
             // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
             let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
             // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
             return;
         },
-        /*  Averages power consumption, weighted with exponential decay, perhaps 1/(2^(x+1)).  
-            TODO: We need to compensate for the uneven distribution of consumption, 
-            since weights won't usually add up to 1.
+        /*  Averages power consumption, weighted with exponential decay by minutes, perhaps 1/(2^(x+1)).  
+            Total with a Riemann sum (rectangles to the right of the decreasing weight curve).
+            Weights will not exactly add to 1.0 , so divide by sum of weights to compensate.  
         */
         averageRecentConsumption () {
             let lastTime = null;
             let runningTotal = 0;
+            let weightTotal = 0;
             for (const [time, consumption] of this.powerConsumption){
                 if(lastTime != null){
                     let minutesAgo = (new Date() - time)/1000;
                     let minutesPeriod = (time - lastTime)/1000;
-                    let consumptionWattMinutes = consumption*(Math.pow(2, minutesAgo + 1));
-                    runningTotal += consumptionWattMinutes * minutesPeriod;
+                    let weight = Math.pow(2, minutesAgo + 1);
+                    weightTotal += weight;
+                    runningTotal += consumption * weight * minutesPeriod;
                 }
                 lastTime = time;
             }
-            // TODO
+            this.averageRecentConsumption = runningTotal / weightTotal;
+            return this.averageRecentConsumption;
+        },
+        getRecentConsumption () {
+            return this.powerConsumption[this.lastUpdated];
         }
     };
     plugDevicesByName.set(plugName, newPlug);
     plugDevicesByPriority[powerPriority].push(plugName);
     updatePlugsByOnTime();
+    if(isSelf){
+        selfPlug = newPlug;
+    }
     return newPlug;
 };
 
@@ -136,8 +153,7 @@ function plugComparator(name1, name2){
         // Significant load > insignificant load > no load
         if(plug.currentlyExceedsThreshold()){
             return 2;
-        }
-        else if(plug.isLoaded()){
+        }else if (plug.isCircuitClosed){
             return 1;
         }else{
             return 0;
@@ -182,7 +198,7 @@ function rebalancePlugs(wattsToAdd){
         for(const currentPlugName of plugList){
             let currentPlug = plugDevicesByName[currentPlugName];
             if (!desiredPlugStatus){ // Shedding plugs, so look at present current consumption
-                if (currentPlug.isLoaded()) {
+                if (currentPlug.isCircuitClosed()) {
                     remainingWatts -= currentPlug.powerConsumption;
                     plugNamesToToggle.unshift(currentPlugName);
                 }
@@ -190,7 +206,7 @@ function rebalancePlugs(wattsToAdd){
                     break;
                 }
             } else { // Reenabling plugs, so try to power everything in this priority tier first before continuing down.  Use maximum current consumption to avoid overloading circuit in a few seconds.
-                if(currentPlug.isLoaded() && currentPlug.highestConsumption <= remainingWatts){
+                if(currentPlug.isCircuitClosed() && currentPlug.highestConsumption <= remainingWatts){
                     remainingWatts -= currentPlug.highestConsumption;
                     plugNamesToToggle.push(currentPlugName);
                 }
@@ -199,7 +215,7 @@ function rebalancePlugs(wattsToAdd){
         if (!desiredPlugStatus && remainingWatts <= 0) {
             break;
         }
-        // Don't break early when reenabling plugs, as there is always a change another small load can be reenabled
+        // Don't break early when reenabling plugs, as another smaller load could also be reenabled
     }
 
     /* 
@@ -244,7 +260,7 @@ export function verifyCircuitLoad() {
         rebalancePlugs(remainingWatts);
     }}
 
-function decodeParam(params, paramName, isNumber){
+function decodeParam(params, paramName, type){
     let startIndex = params.indexOf(paramName + "=") + paramName.length + 1;
     let endIndex = params.indexOf("&", startIndex);
     if(endIndex >= 0){
@@ -253,10 +269,14 @@ function decodeParam(params, paramName, isNumber){
         var textValue = params.substring(startIndex);
     }
     
-    if (isNumber) {
+    if (type == "number") {
         return Number(textValue);
-    } else {
+    } else if (type == "string") {
         return textValue;
+    } else if (type == "boolean") {
+        return textValue === "true";
+    } else {
+        throw new Error("Invalid type to parse");
     }
 }
 
@@ -265,9 +285,10 @@ export function updatePlugPower(request, response, userdata) {
     let params = request.query;
     let receivedTime = Date();
     console.log("DEBUG: Processing request", params, "at time", receivedTime);
-    let senderName = decodeParam(params, "sender", false);
-    let newPowerValue = decodeParam(params, "value", true);
-    let senderPriority = decodeParam(params, "priority", true);
+    let senderName = decodeParam(params, "sender", "string");
+    let newPowerValue = decodeParam(params, "value", "number");
+    let newCircuitValue = decodeParam(params, "circuitclosed", "number");
+    let senderPriority = decodeParam(params, "priority", "number");
     console.log("DEBUG: Params are", senderName, newPowerValue, senderPriority);
 
     // Respond with "bad request" error if params are not as expected
@@ -285,7 +306,7 @@ export function updatePlugPower(request, response, userdata) {
 
     // TODO
     /*if (!plugDevicesByName.has(senderName)){
-        createPlug(senderName, receivedTime, newPowerValue, senderPriority, false)
+        createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false)
     } else {
         plugDevicesByName.get(senderName).updatePower(receivedTime, newPowerValue)
     }*/
@@ -295,11 +316,22 @@ export function updatePlugPower(request, response, userdata) {
     }
 }
 
+function statusUpdateHandler(status){
+    if(status.component !== "switch:0"){ // TODO: Verify this is the correct status format
+        return;
+    }
+    selfPlug.isCircuitClosed = status.output;
+    selfPlug.updatePower(Date(), status.apower);
+    // TODO: Find a way to async update other plugs
+}
+
 let powerHandlerURL = HTTPServer.registerEndpoint("updatePlugPower", updatePlugPower);
-// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlugPower?sender=OtherPlug&value=100&priority=1
+// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlugPower?sender=OtherPlug&value=100&&circuitclosed=true&priority=1
 // Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
 // TODO: All updates should wait 1 second for inrush current to stabilize
 // TODO: Sending updates ever minute as a heartbeat, so that offline plugs can be pruned from list
 // TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
 
 console.log("Registered power update handler at", powerHandlerURL);
+var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
+
