@@ -2,15 +2,16 @@
     Shelly Script is an implementation of Espruino, a subset of Javascript for embedded devices.
     This script runs on multiple smart plugs with different priority levels, 
     preventing the circuit is being overloaded and prioritizing high priority plugs.
-    Caution: High current loads through consumer-grade smart plugs can damage them over time!
+    Caution: High-current loads through consumer-grade smart plugs can damage them over time!
+             It happened to the dev with a 12-amp 120-volt load with minimal plug cycles!
 */
 export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
 console.log("Starting power load balancer script");
-// TODO: Apparently Espruino treats "let" as "var", so check there are no scope collisions
+// TODO: Espruino 2v13 and earlier treats "let" as "var"; verify version and adjust this script accordingly
 
 /*  Constants
-    Watts are used because they are the default measurement unit for Shelly plugs, 
-    and allow consistent logic when there is fluctuating voltage.
+    Watts are used because they are the primary measurement unit for Shelly plugs, 
+    and allow consistent logic when there is fluctuating mains voltage.
 */
 const significantWattsThreshold = 200; // Below the minimum power of a small, 5000 BTU air conditioner
 const standbyWattsThreshold = 5;
@@ -23,13 +24,14 @@ function exceedsThreshold(compareValue) {
     Caution: This script uses device names as UIDs, so two devices with same name
              will be seen as one device to this script.
     To be safe, name devices only with alphanumerics and hyphens ([a-z0-9\-]+), NO SPACES!
-    */
+*/
 //const deviceName = Shelly.getComponentConfig("System:device:name").replaceAll(" ", "-")
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
 export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
 const minPriority = 5;
 const globalUsername = "peppermint";
 const globalPassword = "Sysssadm1n!";
+var needToUpdateOtherPlugs = false;
 
 // Map of plugs' mDNS names and their properties
 export var plugDevicesByName = new Map();
@@ -44,13 +46,21 @@ export function updatePlugsByOnTime() {
     });
 };
 
-const isLeader = true; // TODO: Plug that's online the longest should become the "leader" while other plugs are the "followers"
+const isLeader = true;
+/*  TODO: Make a system where plugs will decide which becomes the leader by longest time online.
+    A leader plug that has been offline for 25 seconds (two check-in periods) is "voted out".
+    Any plug can send a "voting motion" with a uniqute voting UID to the other plugs, 
+    which triggers all to evalute the voting scenario. Each plug sends its vote to all the others, 
+    then all plugs tally the votes and send their tally to the others.  If any plug detects a tally mismatch, 
+    it sends a mismatch signal to the others, which rebroadcast it.  Then the vote is redone, 
+    with a decreasing retry count until a fallback scenario is reached.  o0p
+
+*/
 
 function buildPlugURL(plugName, path){
     return "http://" + plugName + ".local/" + path;
 }
 
-// TODO: Add self to list
 export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powerPriority, isCircuitClosed, isSelf) {
     let newPlug = {
         plugName: plugName,
@@ -108,7 +118,17 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
             let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
             // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
-            return;
+        },
+        updatePriority (newPriority) {
+            if (newPriority == this.powerPriority){
+                return;
+            }
+            let oldPriority = this.powerPriority;
+            this.powerPriority = newPriority;
+            plugDevicesByPriority[newPriority].push(this);
+            let targetIndex = plugDevicesByPriority[this.oldPriority].findIndex((testPlug) => testPlug.plugName == this.plugName)
+            plugDevicesByPriority[oldPriority].splice(targetIndex);
+            // Assumes sort will be called right after this
         },
         /*  Averages power consumption, weighted with exponential decay by minutes, perhaps 1/(2^(x+1)).  
             Total with a Riemann sum (rectangles to the right of the decreasing weight curve).
@@ -280,11 +300,11 @@ function decodeParam(params, paramName, type){
     }
 }
 
-export function updatePlugPower(request, response, userdata) {
+export function updatePlug(request, response, userdata) {
     // Decode request parameters
     let params = request.query;
     let receivedTime = Date();
-    console.log("DEBUG: Processing request", params, "at time", receivedTime);
+    console.log("DEBUG: Processing plug update request", params, "at time", receivedTime);
     let senderName = decodeParam(params, "sender", "string");
     let newPowerValue = decodeParam(params, "value", "number");
     let newCircuitValue = decodeParam(params, "circuitclosed", "number");
@@ -292,6 +312,7 @@ export function updatePlugPower(request, response, userdata) {
     console.log("DEBUG: Params are", senderName, newPowerValue, senderPriority);
 
     // Respond with "bad request" error if params are not as expected
+    // TODO: Make all values optional.  Handle changing priority.   
     if (senderName == null || isNaN(newPowerValue) || isNaN(senderPriority)) {
         response.code = 400;
     } else {
@@ -316,22 +337,33 @@ export function updatePlugPower(request, response, userdata) {
     }
 }
 
+// Called by host OS when there is a status update
 function statusUpdateHandler(status){
     if(status.component !== "switch:0"){ // TODO: Verify this is the correct status format
         return;
     }
     selfPlug.isCircuitClosed = status.output;
     selfPlug.updatePower(Date(), status.apower);
-    // TODO: Find a way to async update other plugs
+    needToUpdateOtherPlugs = true;
 }
-
-let powerHandlerURL = HTTPServer.registerEndpoint("updatePlugPower", updatePlugPower);
-// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlugPower?sender=OtherPlug&value=100&&circuitclosed=true&priority=1
-// Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
-// TODO: All updates should wait 1 second for inrush current to stabilize
-// TODO: Sending updates ever minute as a heartbeat, so that offline plugs can be pruned from list
-// TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
-
-console.log("Registered power update handler at", powerHandlerURL);
 var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
+console.log("DEBUG: Registered internal status listener");
 
+var updateHandlerURL = HTTPServer.registerEndpoint("updatePlug", updatePlug);
+console.log("Registered plug update handler at", updateHandlerURL);
+// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlug?sender=OtherPlug&value=100&&circuitclosed=true&priority=1
+// Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
+// TODO: All updates should wait 1 second for inrush current to stabilize, especially for large transformers (like in cheap microwaves)
+// TODO: Sending updates every 10 seconds as a heartbeat, so that offline plugs can be pruned from list
+// TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
+// TODO: Send "hello" to other plugs upon startup, so they can reset their statistics, and add self to plug list.
+// TODO: Periodically check needToUpdateOtherPlugs
+
+export function processVoteRequest(request, response, userdata) {
+    let params = request.query;
+    let receivedTime = Date();
+    console.log("DEBUG: Processing vote request", params, "at time", receivedTime);
+    // TODO
+}
+var voteHandlerURL = HTTPServer.registerEndpoint("voteRequest", processVoteRequest);
+console.log("Registered vote request handler at", voteHandlerURL);
