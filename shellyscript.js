@@ -29,9 +29,11 @@ function exceedsThreshold(compareValue) {
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
 export const circuitLimitWatts = 0.8*20*110; // Circuit is limited to 80% of breaker rating (20 amps) at mains voltage (pessimistically at 110 volts)
 const minPriority = 5;
-const globalUsername = "peppermint";
-const globalPassword = "Sysssadm1n!";
+const commonUsername = "peppermint";
+const commonPassword = "Sysssadm1n!"; // Plugs will be behind firewall, so this is relatively safe
+
 var needToUpdateOtherPlugs = false;
+var isLeader = true;
 
 // Map of plugs' mDNS names and their properties
 export var plugDevicesByName = new Map();
@@ -45,17 +47,6 @@ export function updatePlugsByOnTime() {
         nameList.sort(plugComparator);
     });
 };
-
-const isLeader = true;
-/*  TODO: Make a system where plugs will decide which becomes the leader by longest time online.
-    A leader plug that has been offline for 25 seconds (two check-in periods) is "voted out".
-    Any plug can send a "voting motion" with a uniqute voting UID to the other plugs, 
-    which triggers all to evalute the voting scenario. Each plug sends its vote to all the others, 
-    then all plugs tally the votes and send their tally to the others.  If any plug detects a tally mismatch, 
-    it sends a mismatch signal to the others, which rebroadcast it.  Then the vote is redone, 
-    with a decreasing retry count until a fallback scenario is reached.  o0p
-
-*/
 
 function buildPlugURL(plugName, path){
     return "http://" + plugName + ".local/" + path;
@@ -120,6 +111,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
         },
         updatePriority (newPriority) {
+            // Does not update timeLastCrossedThreshold because watts are used for that, and validation/sanity check will catch issues
             if (newPriority == this.powerPriority){
                 return;
             }
@@ -218,7 +210,7 @@ function rebalancePlugs(wattsToAdd){
         for(const currentPlugName of plugList){
             let currentPlug = plugDevicesByName[currentPlugName];
             if (!desiredPlugStatus){ // Shedding plugs, so look at present current consumption
-                if (currentPlug.isCircuitClosed()) {
+                if (currentPlug.isCircuitClosed) {
                     remainingWatts -= currentPlug.powerConsumption;
                     plugNamesToToggle.unshift(currentPlugName);
                 }
@@ -226,7 +218,7 @@ function rebalancePlugs(wattsToAdd){
                     break;
                 }
             } else { // Reenabling plugs, so try to power everything in this priority tier first before continuing down.  Use maximum current consumption to avoid overloading circuit in a few seconds.
-                if(currentPlug.isCircuitClosed() && currentPlug.highestConsumption <= remainingWatts){
+                if(currentPlug.isCircuitClosed && currentPlug.highestConsumption <= remainingWatts){
                     remainingWatts -= currentPlug.highestConsumption;
                     plugNamesToToggle.push(currentPlugName);
                 }
@@ -281,7 +273,11 @@ export function verifyCircuitLoad() {
     }}
 
 function decodeParam(params, paramName, type){
+    // TODO: what if indexf fails?
     let startIndex = params.indexOf(paramName + "=") + paramName.length + 1;
+    if(startIndex == -1){
+        return null;
+    }
     let endIndex = params.indexOf("&", startIndex);
     if(endIndex >= 0){
         var textValue = params.substring(startIndex, endIndex);
@@ -294,6 +290,12 @@ function decodeParam(params, paramName, type){
     } else if (type == "string") {
         return textValue;
     } else if (type == "boolean") {
+        if(length(textValue) == 0){
+            return null;
+        }
+        if(!(textValue === "true" || textValue === "false")){
+            throw new Error("Could not parse boolean");
+        }
         return textValue === "true";
     } else {
         throw new Error("Invalid type to parse");
@@ -303,20 +305,43 @@ function decodeParam(params, paramName, type){
 export function updatePlug(request, response, userdata) {
     // Decode request parameters
     let params = request.query;
-    let receivedTime = Date();
+    let receivedTime = Date(); // Use internal clock for everything to avoid syncing clocks between devices
     console.log("DEBUG: Processing plug update request", params, "at time", receivedTime);
+    // TODO: Gracefully handle errors thrown by parser
     let senderName = decodeParam(params, "sender", "string");
     let newPowerValue = decodeParam(params, "value", "number");
-    let newCircuitValue = decodeParam(params, "circuitclosed", "number");
+    let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean");
     let senderPriority = decodeParam(params, "priority", "number");
-    console.log("DEBUG: Params are", senderName, newPowerValue, senderPriority);
+    console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus. senderPriority);
 
-    // Respond with "bad request" error if params are not as expected
-    // TODO: Make all values optional.  Handle changing priority.   
-    if (senderName == null || isNaN(newPowerValue) || isNaN(senderPriority)) {
+    // Process parameters, responding with "bad request" if params are not as expected
+    response.code = 200;
+    if (senderName == null) {
         response.code = 400;
+    }
+
+    if (!plugDevicesByName.has(senderName)){
+        createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false);
     } else {
-        response.code = 200;
+        let senderObj = plugDevicesByName.get(senderName);
+    
+        if(newPowerValue !== null && !isNaN(newPowerValue)){
+            if(!(0<newPowerValue)){
+                response.code = 400;
+            }else{
+                senderObj.updatePower(receivedTime, newPowerValue);
+            }
+        }
+        if(newCircuitStatus !== null){
+            senderObj.isCircuitClosed = newCircuitStatus;
+        }
+        if(senderPriority !== null && !isNaN(senderPriority)){
+            if(!(0<senderPriority<minPriority)){
+                response.code = 400;
+            }else{
+                senderObj.updatePriority(senderPriority);
+            }
+        }
     }
 
     if (!response.send()){
@@ -324,13 +349,6 @@ export function updatePlug(request, response, userdata) {
     }else{
         console.log("DEBUG: Sent response for request", params, "with status", response.code);
     }
-
-    // TODO
-    /*if (!plugDevicesByName.has(senderName)){
-        createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false)
-    } else {
-        plugDevicesByName.get(senderName).updatePower(receivedTime, newPowerValue)
-    }*/
 
     if(isLeader){
         verifyCircuitLoad();
@@ -359,6 +377,16 @@ console.log("Registered plug update handler at", updateHandlerURL);
 // TODO: Send "hello" to other plugs upon startup, so they can reset their statistics, and add self to plug list.
 // TODO: Periodically check needToUpdateOtherPlugs
 
+
+/*  TODO: Make a system where plugs will decide which becomes the leader by longest time online.
+    A leader plug that has been offline for 25 seconds (two check-in periods) is "voted out".
+    Any plug can send a "voting motion" with a uniqute voting UID to the other plugs, 
+    which triggers all to evalute the voting scenario. Each plug sends its vote to all the others, 
+    then all plugs tally the votes and send their tally to the others.  If any plug detects a tally mismatch, 
+    it sends a mismatch signal to the others, which rebroadcast it.  Then the vote is redone, 
+    with a decreasing retry count until a fallback scenario is reached.  o0p
+
+*/
 export function processVoteRequest(request, response, userdata) {
     let params = request.query;
     let receivedTime = Date();
