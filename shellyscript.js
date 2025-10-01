@@ -7,7 +7,6 @@
 */
 export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
 console.log("Starting power load balancer script");
-// TODO: Espruino 2v13 and earlier treats "let" as "var"; verify version and adjust this script accordingly
 
 /*  Constants
     Watts are used because they are the primary measurement unit for Shelly plugs, 
@@ -35,16 +34,15 @@ const commonPassword = "Sysssadm1n!"; // Plugs will be behind firewall, so this 
 var needToUpdateOtherPlugs = false;
 var isLeader = true;
 
-// Map of plugs' mDNS names and their properties
-export var plugDevicesByName = new Map();
+export var plugDevicesByName = new Map(); // Map of plugs' mDNS names and their properties
 export var plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
-// User needs to include this plug in  list of plug names
+// User needs to include this plug's mDNS name in the following list of plug names
 const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declared in script instead of KVS to avoid character limit
 var selfPlug = null;
 export function updatePlugsByOnTime() {
     // Go through each priority's sublist and sort it
     plugDevicesByPriority.forEach((nameList) => {
-        nameList.sort(plugComparator);
+        nameList.sort(plugComparatorByName);
     });
 };
 
@@ -107,6 +105,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             // TODO: don't use HTTP for self
             let desiredStatus = powerStatus ? "on" : "off";
             // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
+            // TODO: include credentials here
             let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
             // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
         },
@@ -157,12 +156,12 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
 };
 
 // Compares plugs for sorting.  Assumes all plugs are the same priority.  
-function plugComparator(name1, name2){
+function plugComparatorByName(name1, name2){
     let plug1 = plugDevicesByName[name1];
     let plug2 = plugDevicesByName[name2];
 
     function determinePlugConsumptionTier(plug){
-        // Significant load > insignificant load > no load
+        // Significant load > insignificant load > open circuit (should be <1 watt)
         if(plug.currentlyExceedsThreshold()){
             return 2;
         }else if (plug.isCircuitClosed){
@@ -177,7 +176,7 @@ function plugComparator(name1, name2){
 
     if (plug1ConsumptionTier == plug2ConsumptionTier){
         // Within each tier, sort by longest time since toggle, e.g.
-        // On long time > on short time > off long time > off short time
+        // On for long time > on for short time > off for long time > off for short time
         return (plug1.timeLastCrossedThreshold - plug2.timeLastCrossedThreshold);
     } else {
         return (plug1ConsumptionTier - plug2ConsumptionTier);
@@ -256,7 +255,6 @@ function rebalancePlugs(wattsToAdd){
 }
 
 export function verifyCircuitLoad() {
-    let plugsToDrop = []
     /* Calculate total load, and remove longest-running significant consumption from that load
        until total is under threshold.  */
     console.log("DEBUG: Checking circuit load")
@@ -270,10 +268,12 @@ export function verifyCircuitLoad() {
 
     if (remainingWatts < 0) {
         rebalancePlugs(remainingWatts);
-    }}
+    }
+    console.log("DEBUG: Finished checking circuit load");
+}
 
 function decodeParam(params, paramName, type){
-    // TODO: what if indexf fails?
+    // Get starting and ending character of parameter's value
     let startIndex = params.indexOf(paramName + "=") + paramName.length + 1;
     if(startIndex == -1){
         return null;
@@ -281,7 +281,7 @@ function decodeParam(params, paramName, type){
     let endIndex = params.indexOf("&", startIndex);
     if(endIndex >= 0){
         var textValue = params.substring(startIndex, endIndex);
-    }else{
+    }else{ // Assume this is the final parameter
         var textValue = params.substring(startIndex);
     }
     
@@ -308,40 +308,45 @@ export function updatePlug(request, response, userdata) {
     let receivedTime = Date(); // Use internal clock for everything to avoid syncing clocks between devices
     console.log("DEBUG: Processing plug update request", params, "at time", receivedTime);
     // TODO: Gracefully handle errors thrown by parser
-    let senderName = decodeParam(params, "sender", "string");
-    let newPowerValue = decodeParam(params, "value", "number");
-    let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean");
-    let senderPriority = decodeParam(params, "priority", "number");
-    console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus. senderPriority);
+    try {
+        let senderName = decodeParam(params, "sender", "string");
+        let newPowerValue = decodeParam(params, "value", "number");
+        let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean");
+        let senderPriority = decodeParam(params, "priority", "number");
+        console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus. senderPriority);
 
-    // Process parameters, responding with "bad request" if params are not as expected
-    response.code = 200;
-    if (senderName == null) {
+        // Process parameters, responding with "bad request" if params are not as expected
+        response.code = 200;
+        if (senderName == null) {
+            response.code = 400;
+        }
+
+        if (!plugDevicesByName.has(senderName)){
+            createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false);
+        } else {
+            let senderObj = plugDevicesByName.get(senderName);
+        
+            if(newPowerValue !== null && !isNaN(newPowerValue)){
+                if(!(0<newPowerValue)){
+                    response.code = 400;
+                }else{
+                    senderObj.updatePower(receivedTime, newPowerValue);
+                }
+            }
+            if(newCircuitStatus !== null){
+                senderObj.isCircuitClosed = newCircuitStatus;
+            }
+            if(senderPriority !== null && !isNaN(senderPriority)){
+                if(!(0<senderPriority<minPriority)){
+                    response.code = 400;
+                }else{
+                    senderObj.updatePriority(senderPriority);
+                }
+            }
+        }
+    } catch (error) {
+        console.log("ERROR: Parsing request", params, "failed with error message", error)
         response.code = 400;
-    }
-
-    if (!plugDevicesByName.has(senderName)){
-        createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false);
-    } else {
-        let senderObj = plugDevicesByName.get(senderName);
-    
-        if(newPowerValue !== null && !isNaN(newPowerValue)){
-            if(!(0<newPowerValue)){
-                response.code = 400;
-            }else{
-                senderObj.updatePower(receivedTime, newPowerValue);
-            }
-        }
-        if(newCircuitStatus !== null){
-            senderObj.isCircuitClosed = newCircuitStatus;
-        }
-        if(senderPriority !== null && !isNaN(senderPriority)){
-            if(!(0<senderPriority<minPriority)){
-                response.code = 400;
-            }else{
-                senderObj.updatePriority(senderPriority);
-            }
-        }
     }
 
     if (!response.send()){
@@ -395,3 +400,10 @@ export function processVoteRequest(request, response, userdata) {
 }
 var voteHandlerURL = HTTPServer.registerEndpoint("voteRequest", processVoteRequest);
 console.log("Registered vote request handler at", voteHandlerURL);
+
+// TODO: Espruino 2v13 and earlier treats "let" as "var"; verify version and adjust this script accordingly
+let testVariable = "outside";
+if (true) {
+    let testVariable = "inside";
+}
+console.log("DEBUG: using keyword let will presist", testVariable);
