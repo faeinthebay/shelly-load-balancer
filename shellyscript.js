@@ -118,7 +118,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             }
             let oldPriority = this.powerPriority;
             this.powerPriority = newPriority;
-            plugDevicesByPriority[newPriority].push(this);
+            plugDevicesByPriority[newPriority].push(this.plugName);
             let targetIndex = plugDevicesByPriority[this.oldPriority].findIndex((testPlug) => testPlug.plugName == this.plugName)
             plugDevicesByPriority[oldPriority].splice(targetIndex);
             // Assumes sort will be called right after this
@@ -126,6 +126,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
         /*  Averages power consumption, weighted with exponential decay by minutes, perhaps 1/(2^(x+1)).  
             Total with a Riemann sum (rectangles to the right of the decreasing weight curve).
             Weights will not exactly add to 1.0 , so divide by sum of weights to compensate.  
+            Cannot use Exponential Moving Average due to inconsistent reporting periods.  
         */
         refreshRecentConsumption () {
             let lastTime = null;
@@ -137,7 +138,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                     let minutesPeriod = (time - lastTime)/1000;
                     let weight = Math.pow(2, minutesAgo + 1);
                     weightTotal += weight;
-                    runningTotal += consumption * weight * minutesPeriod;
+                    runningTotal += (consumption * minutesPeriod / weight);
                 }
                 lastTime = time;
             }
@@ -203,7 +204,7 @@ function rebalancePlugs(wattsToAdd){
     let priorityLevel = desiredPlugStatus ? 0 : plugDevicesByPriority.length - 1;
     let priorityChangePerLoop = desiredPlugStatus ? 1 : -1;
     for(; priorityLevel >= 0 && priorityLevel < plugDevicesByPriority.length; priorityLevel+=priorityChangePerLoop) {
-        let plugList = plugDevicesByName.get(priorityLevel);
+        let plugList = plugDevicesByPriority[priorityLevel];
         if (plugList === undefined){
             // No plugs at this priority level
             continue;
@@ -239,7 +240,7 @@ function rebalancePlugs(wattsToAdd){
         When reenabling plugs, we stop before going over capacity
         (and don't want to drop a higher priority plug that is further down the list), so this pass is skipped.
     */
-    if(desiredPlugStatus){
+    if(!desiredPlugStatus){
         for (const currentPlugName of plugNamesToToggle) {
             let currentPlug = plugDevicesByName.get(currentPlugName);
             if (currentPlug.highestConsumption < -remainingWatts) {
@@ -290,7 +291,7 @@ function decodeParam(params, paramName, type){
     } else if (type == "string") {
         return textValue;
     } else if (type == "boolean") {
-        if(length(textValue) == 0){
+        if(textValue.length === 0){
             return null;
         }
         if(!(textValue === "true" || textValue === "false")){
