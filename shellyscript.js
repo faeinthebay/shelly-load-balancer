@@ -1,9 +1,9 @@
 /*  This is a load balancer script for Shelly Plugs written in Shelly Script.
     Shelly Script is an implementation of Espruino, a subset of Javascript for embedded devices.
     This script runs on multiple smart plugs with different priority levels, 
-    preventing the circuit is being overloaded and prioritizing high priority plugs.
+    preventing the circuit from being overloaded by deprioritizing low-priority plugs.
     Caution: High-current loads through consumer-grade smart plugs can damage them over time!
-             It happened to the dev with a 12-amp 120-volt load with minimal plug cycles!
+             It happened to me with a 12-amp 120-volt load with minimal cyclings!
 */
 export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
 console.log("Starting power load balancer script");
@@ -16,13 +16,13 @@ const significantWattsThreshold = 200; // Below the minimum power of a small, 50
 const standbyWattsThreshold = 5;
 const significantWattChange = 5; // Watts difference that is ignored
 const minutesPowerHistory = 5;
-function exceedsThreshold(compareValue) {
-    return compareValue > significantWattsThreshold;
-}
+const ownPriority = 5; // See line 68 (TODO) for priorities
+// User needs to include this plug's name in the following list of plug names
+const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declared in script instead of KVS to avoid character limit
+
 /*
-    Caution: This script uses device names as UIDs, so two devices with same name
-             will be seen as one device to this script.
-    To be safe, name devices only with alphanumerics and hyphens ([a-z0-9\-]+), NO SPACES!
+    Caution: Device names should only contain alphanumerics and hyphens ([a-z0-9\-]+), NO SPACES!
+    That allows device names to be identical to their mDNS URLs.  Never use the same name for 2 devices.
 */
 //const deviceName = Shelly.getComponentConfig("System:device:name").replaceAll(" ", "-")
 //console.log("DEBUG: The dectected device name is ", Shelly.getComponentConfig("System:device:name"), " which has been simplified to ", deviceName)
@@ -34,10 +34,12 @@ const commonPassword = "Sysssadm1n!"; // Plugs will be behind firewall, so this 
 var needToUpdateOtherPlugs = false;
 var isLeader = true;
 
-export var plugDevicesByName = new Map(); // Map of plugs' mDNS names and their properties
+function exceedsThreshold(compareValue) {
+    return compareValue > significantWattsThreshold;
+}
+
+export var plugDevicesByName = new Map(); // Map of plug names and their properties
 export var plugDevicesByPriority = new Array(); // Array of Arrays of names, with longest active plug first and longest inactive plug last
-// User needs to include this plug's mDNS name in the following list of plug names
-const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declared in script instead of KVS to avoid character limit
 var selfPlug = null;
 export function updatePlugsByOnTime() {
     // Go through each priority's sublist and sort it
@@ -241,7 +243,7 @@ function rebalancePlugs(wattsToAdd){
         for (const currentPlugName of plugNamesToToggle) {
             let currentPlug = plugDevicesByName.get(currentPlugName);
             if (currentPlug.highestConsumption < -remainingWatts) {
-                plugNamesToToggle.splice(plugIndex, 1);
+                plugNamesToToggle.splice(plugNamesToToggle.indexOf(currentPlugName, 1));
                 remainingWatts += currentPlug.highestConsumption;
             }
         }
@@ -255,8 +257,6 @@ function rebalancePlugs(wattsToAdd){
 }
 
 export function verifyCircuitLoad() {
-    /* Calculate total load, and remove longest-running significant consumption from that load
-       until total is under threshold.  */
     console.log("DEBUG: Checking circuit load")
 
     let remainingWatts = circuitLimitWatts;
@@ -374,13 +374,15 @@ console.log("DEBUG: Registered internal status listener");
 
 var updateHandlerURL = HTTPServer.registerEndpoint("updatePlug", updatePlug);
 console.log("Registered plug update handler at", updateHandlerURL);
-// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlug?sender=OtherPlug&value=100&&circuitclosed=true&priority=1
+// Full URL will look like: http://Shelly-Plug.local/script/1/updatePlug?sender=OtherPlug&value=100&&circuitclosed=true&priority=1&startup=false
 // Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
 // TODO: All updates should wait 1 second for inrush current to stabilize, especially for large transformers (like in cheap microwaves)
 // TODO: Sending updates every 10 seconds as a heartbeat, so that offline plugs can be pruned from list
 // TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
-// TODO: Send "hello" to other plugs upon startup, so they can reset their statistics, and add self to plug list.
-// TODO: Periodically check needToUpdateOtherPlugs
+// TODO: Send "hello" to other plugs upon startup, so they can reset their statistics, and add self to plug list.  
+// TODO: When hello is received, reset plug statistics and resend own statistics.  
+// TODO: Periodically check needToUpdateOtherPlugs.  For self, replace domain with 127.0.0.1.  
+// TODO: If plug cannot communicate, open its circuit
 
 
 /*  TODO: Make a system where plugs will decide which becomes the leader by longest time online.
@@ -389,7 +391,7 @@ console.log("Registered plug update handler at", updateHandlerURL);
     which triggers all to evalute the voting scenario. Each plug sends its vote to all the others, 
     then all plugs tally the votes and send their tally to the others.  If any plug detects a tally mismatch, 
     it sends a mismatch signal to the others, which rebroadcast it.  Then the vote is redone, 
-    with a decreasing retry count until a fallback scenario is reached.  o0p
+    with a decreasing retry count until a fallback scenario is reached.  
 
 */
 export function processVoteRequest(request, response, userdata) {
