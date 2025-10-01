@@ -71,7 +71,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
         isSelf: isSelf,
         isCircuitClosed: isCircuitClosed,
         currentlyExceedsThreshold () {
-            return exceedsThreshold(powerConsumption);
+            return exceedsThreshold(averageRecentConsumption);
         },
         updatePower (time, newPower) {
             if(Math.abs(newPower - getRecentConsumption()) < 5){
@@ -98,7 +98,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                 }
             }
 
-            this.averageRecentConsumption();
+            this.refreshRecentConsumption();
             updatePlugsByOnTime();
         },
         setPower (powerStatus) {
@@ -125,7 +125,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             Total with a Riemann sum (rectangles to the right of the decreasing weight curve).
             Weights will not exactly add to 1.0 , so divide by sum of weights to compensate.  
         */
-        averageRecentConsumption () {
+        refreshRecentConsumption () {
             let lastTime = null;
             let runningTotal = 0;
             let weightTotal = 0;
@@ -143,7 +143,7 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             return this.averageRecentConsumption;
         },
         getRecentConsumption () {
-            return this.powerConsumption[this.lastUpdated];
+            return this.powerConsumption.get(this.lastUpdated);
         }
     };
     plugDevicesByName.set(plugName, newPlug);
@@ -157,8 +157,8 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
 
 // Compares plugs for sorting.  Assumes all plugs are the same priority.  
 function plugComparatorByName(name1, name2){
-    let plug1 = plugDevicesByName[name1];
-    let plug2 = plugDevicesByName[name2];
+    let plug1 = plugDevicesByName.get(name1);
+    let plug2 = plugDevicesByName.get(name2);
 
     function determinePlugConsumptionTier(plug){
         // Significant load > insignificant load > open circuit (should be <1 watt)
@@ -201,16 +201,16 @@ function rebalancePlugs(wattsToAdd){
     let priorityLevel = desiredPlugStatus ? 0 : plugDevicesByPriority.length - 1;
     let priorityChangePerLoop = desiredPlugStatus ? 1 : -1;
     for(; priorityLevel >= 0 && priorityLevel < plugDevicesByPriority.length; priorityLevel+=priorityChangePerLoop) {
-        let plugList = plugDevicesByName[priorityLevel];
+        let plugList = plugDevicesByName.get(priorityLevel);
         if (plugList === undefined){
             // No plugs at this priority level
             continue;
         }
         for(const currentPlugName of plugList){
-            let currentPlug = plugDevicesByName[currentPlugName];
+            let currentPlug = plugDevicesByName.get(currentPlugName);
             if (!desiredPlugStatus){ // Shedding plugs, so look at present current consumption
                 if (currentPlug.isCircuitClosed) {
-                    remainingWatts -= currentPlug.powerConsumption;
+                    remainingWatts -= currentPlug.averageRecentConsumption;
                     plugNamesToToggle.unshift(currentPlugName);
                 }
                 if (remainingWatts <= 0) {
@@ -239,7 +239,7 @@ function rebalancePlugs(wattsToAdd){
     */
     if(desiredPlugStatus){
         for (const currentPlugName of plugNamesToToggle) {
-            let currentPlug = plugDevicesByName[currentPlugName];
+            let currentPlug = plugDevicesByName.get(currentPlugName);
             if (currentPlug.highestConsumption < -remainingWatts) {
                 plugNamesToToggle.splice(plugIndex, 1);
                 remainingWatts += currentPlug.highestConsumption;
@@ -250,7 +250,7 @@ function rebalancePlugs(wattsToAdd){
     // Toggle plugs
     for (const plugName of plugNamesToToggle) {
         console.log("Toggling plug", plugName, "to", desiredPlugStatus);
-        plugDevicesByName[plugName].setPower(desiredPlugStatus);
+        plugDevicesByName.get(plugName).setPower(desiredPlugStatus);
     }
 }
 
@@ -261,7 +261,7 @@ export function verifyCircuitLoad() {
 
     let remainingWatts = circuitLimitWatts;
     for (const [plugName, plug] of plugDevicesByName){
-        remainingWatts -= plug.powerConsumption;
+        remainingWatts -= plug.averageRecentConsumption;
     }
 
     console.log("DEBUG: Circuit has spare capacity of", remainingWatts, "watts from a total of", circuitLimitWatts);
@@ -305,7 +305,7 @@ function decodeParam(params, paramName, type){
 export function updatePlug(request, response, userdata) {
     // Decode request parameters
     let params = request.query;
-    let receivedTime = Date(); // Use internal clock for everything to avoid syncing clocks between devices
+    let receivedTime = new Date(); // Use internal clock for everything to avoid syncing clocks between devices
     console.log("DEBUG: Processing plug update request", params, "at time", receivedTime);
     // TODO: Gracefully handle errors thrown by parser
     try {
@@ -313,7 +313,7 @@ export function updatePlug(request, response, userdata) {
         let newPowerValue = decodeParam(params, "value", "number");
         let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean");
         let senderPriority = decodeParam(params, "priority", "number");
-        console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus. senderPriority);
+        console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus, senderPriority);
 
         // Process parameters, responding with "bad request" if params are not as expected
         response.code = 200;
@@ -327,7 +327,7 @@ export function updatePlug(request, response, userdata) {
             let senderObj = plugDevicesByName.get(senderName);
         
             if(newPowerValue !== null && !isNaN(newPowerValue)){
-                if(!(0<newPowerValue)){
+                if(!(0 < newPowerValue)){
                     response.code = 400;
                 }else{
                     senderObj.updatePower(receivedTime, newPowerValue);
@@ -337,7 +337,7 @@ export function updatePlug(request, response, userdata) {
                 senderObj.isCircuitClosed = newCircuitStatus;
             }
             if(senderPriority !== null && !isNaN(senderPriority)){
-                if(!(0<senderPriority<minPriority)){
+                if(!(0 < senderPriority && senderPriority < minPriority)){
                     response.code = 400;
                 }else{
                     senderObj.updatePriority(senderPriority);
@@ -366,7 +366,7 @@ function statusUpdateHandler(status){
         return;
     }
     selfPlug.isCircuitClosed = status.output;
-    selfPlug.updatePower(Date(), status.apower);
+    selfPlug.updatePower(new Date(), status.apower);
     needToUpdateOtherPlugs = true;
 }
 var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
@@ -394,7 +394,7 @@ console.log("Registered plug update handler at", updateHandlerURL);
 */
 export function processVoteRequest(request, response, userdata) {
     let params = request.query;
-    let receivedTime = Date();
+    let receivedTime = new Date();
     console.log("DEBUG: Processing vote request", params, "at time", receivedTime);
     // TODO
 }
