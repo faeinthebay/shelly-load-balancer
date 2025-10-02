@@ -62,21 +62,22 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
            and an update-sender should block further execution. 
         */
         powerConsumption: new Map([timeLastSeen, presentPowerConsumption]),
-        lastUpdated: timeLastSeen,
-        averageRecentConsumption: NaN,
+        timeLastUpdated: timeLastSeen,
+        averageRecentConsumption: presentPowerConsumption,
+        greaterConsumption: presentPowerConsumption, // The highest recent consumption (averaged values or most recent value)
         powerPriority: powerPriority, /* Lower number is higher priority.
         0 is critical to life (oxygen concentrator), 1 is critical to property (refrigerator), 
         2 is useful (lighting/tools/appliances/desktop computer), 3 is general-purpose (laptop charger/air conditioner in occupied room), 
         4 is low priority (heated blanket/air conditioner in unoccupied room), 5 is minimum priority (vehicle chargers) */
         timeLastCrossedThreshold: timeLastSeen,
-        highestConsumption: presentPowerConsumption,
+        highestConsumption: presentPowerConsumption, // Greatest value ever seen during this period turned on, and recent peak when turned off
         isSelf: isSelf,
         isCircuitClosed: isCircuitClosed,
         currentlyExceedsThreshold () {
             return exceedsThreshold(averageRecentConsumption);
         },
         updatePower (time, newPower) {
-            if(Math.abs(newPower - getRecentConsumption()) < 5){
+            if(Math.abs(newPower - this.powerConsumption[this.timeLastUpdated]) < 5){
                 return;
             }
             if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
@@ -84,7 +85,6 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             }
             if(newPower > this.highestConsumption){
                 this.highestConsumption = newPower;
-                // TODO: Reset highest consumption after 24 hours below significant threshold
             }
             timeLastSeen = time;
 
@@ -99,13 +99,15 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                     break;
                 }
             }
+            this.timeLastUpdated = time;
 
             this.refreshRecentConsumption();
             updatePlugsByOnTime();
         },
         setPower (powerStatus) {
-            // TODO: don't use HTTP for self
+            // TODO: don't use HTTP to toggle self
             let desiredStatus = powerStatus ? "on" : "off";
+            console.log("Toggling plug", this.plugName, "to", desiredStatus);
             // Shelly.call("Switch.Set", {id: 0, on: powerStatus});
             // TODO: include credentials here
             let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
@@ -143,10 +145,14 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                 lastTime = time;
             }
             this.averageRecentConsumption = runningTotal / weightTotal;
+            this.greaterConsumption = Math.max(this.averageRecentConsumption, this.powerConsumption[this.timeLastUpdated]);
             return this.averageRecentConsumption;
         },
-        getRecentConsumption () {
-            return this.powerConsumption.get(this.lastUpdated);
+        updateCircuitClosed(newCircuitStatus){
+            if(newCircuitStatus == false){
+                this.highestConsumption = this.greaterConsumption;
+            }
+            this.isCircuitClosed = newCircuitStatus;
         }
     };
     plugDevicesByName.set(plugName, newPlug);
@@ -192,6 +198,7 @@ function plugComparatorByName(name1, name2){
     A lock is not necessary because Espruino should allow functions to finish before handling a new event.
 */
 function rebalancePlugs(wattsToAdd){
+    console.log("DEBUG: Rebalancing circuit with spare capacity of", wattsToAdd, "watts")
     let remainingWatts = Math.abs(wattsToAdd);
     let plugNamesToToggle = new Array();
     let desiredPlugStatus = (wattsToAdd > 0); // Will be false if shedding, since plugs will be turned off
@@ -213,16 +220,18 @@ function rebalancePlugs(wattsToAdd){
             let currentPlug = plugDevicesByName.get(currentPlugName);
             if (!desiredPlugStatus){ // Shedding plugs, so look at present current consumption
                 if (currentPlug.isCircuitClosed) {
-                    remainingWatts -= currentPlug.averageRecentConsumption;
+                    remainingWatts -= currentPlug.greaterConsumption;
                     plugNamesToToggle.unshift(currentPlugName);
+                    console.log("DEBUG: Considering dropping", currentPlugName, "with", currentPlug.greaterConsumption, "watts of recent peak consumption. ", remainingWatts, "watts remaining.");
                 }
                 if (remainingWatts <= 0) {
                     break;
                 }
             } else { // Reenabling plugs, so try to power everything in this priority tier first before continuing down.  Use maximum current consumption to avoid overloading circuit in a few seconds.
-                if(currentPlug.isCircuitClosed && currentPlug.highestConsumption <= remainingWatts){
+                if(currentPlug.isCircuitClosed && currentPlug.greaterConsumption <= remainingWatts){
                     remainingWatts -= currentPlug.highestConsumption;
                     plugNamesToToggle.push(currentPlugName);
+                    console.log("DEBUG: Will reenable", currentPlugName, "with", currentPlug.greaterConsumption, "watts of recent peak consumption. ", remainingWatts, "watts remaining.");
                 }
             }
         }
@@ -243,16 +252,16 @@ function rebalancePlugs(wattsToAdd){
     if(!desiredPlugStatus){
         for (const currentPlugName of plugNamesToToggle) {
             let currentPlug = plugDevicesByName.get(currentPlugName);
-            if (currentPlug.highestConsumption < -remainingWatts) {
+            if (currentPlug.greaterConsumption < -remainingWatts) {
                 plugNamesToToggle.splice(plugNamesToToggle.indexOf(currentPlugName, 1));
-                remainingWatts += currentPlug.highestConsumption;
+                remainingWatts += currentPlug.greaterConsumption;
+                console.log("DEBUG: No need to drop", currentPlugName, remainingWatts, "remaining");
             }
         }
     }
 
     // Toggle plugs
     for (const plugName of plugNamesToToggle) {
-        console.log("Toggling plug", plugName, "to", desiredPlugStatus);
         plugDevicesByName.get(plugName).setPower(desiredPlugStatus);
     }
 }
@@ -262,10 +271,10 @@ export function verifyCircuitLoad() {
 
     let remainingWatts = circuitLimitWatts;
     for (const [plugName, plug] of plugDevicesByName){
-        remainingWatts -= plug.averageRecentConsumption;
+        remainingWatts -= plug.greaterConsumption;
     }
 
-    console.log("DEBUG: Circuit has spare capacity of", remainingWatts, "watts from a total of", circuitLimitWatts);
+    console.log("DEBUG: Circuit has spare capacity of", remainingWatts, "watts from a total of", circuitLimitWatts, "calculated from recent peak values");
 
     if (remainingWatts < 0) {
         rebalancePlugs(remainingWatts);
@@ -327,15 +336,15 @@ export function updatePlug(request, response, userdata) {
         } else {
             let senderObj = plugDevicesByName.get(senderName);
         
+            if(newCircuitStatus !== null){ // Update circuit status and greatest consumption history, before it is updated with off-values
+                senderObj.updateCircuitClosed(newCircuitStatus);
+            }
             if(newPowerValue !== null && !isNaN(newPowerValue)){
                 if(!(0 < newPowerValue)){
                     response.code = 400;
                 }else{
                     senderObj.updatePower(receivedTime, newPowerValue);
                 }
-            }
-            if(newCircuitStatus !== null){
-                senderObj.isCircuitClosed = newCircuitStatus;
             }
             if(senderPriority !== null && !isNaN(senderPriority)){
                 if(!(0 < senderPriority && senderPriority < minPriority)){
@@ -361,14 +370,16 @@ export function updatePlug(request, response, userdata) {
     }
 }
 
-// Called by host OS when there is a status update
+// Called by host runtime when there is a status update
 function statusUpdateHandler(status){
     if(status.component !== "switch:0"){ // TODO: Verify this is the correct status format
         return;
     }
+    // Verify th
     selfPlug.isCircuitClosed = status.output;
+    // TODO: Wait for 1 second
     selfPlug.updatePower(new Date(), status.apower);
-    needToUpdateOtherPlugs = true;
+    // Need to send updates in a timely fashion, so block and send (as there is no parallel execution)
 }
 var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
 console.log("DEBUG: Registered internal status listener");
@@ -376,7 +387,8 @@ console.log("DEBUG: Registered internal status listener");
 var updateHandlerURL = HTTPServer.registerEndpoint("updatePlug", updatePlug);
 console.log("Registered plug update handler at", updateHandlerURL);
 // Full URL will look like: http://Shelly-Plug.local/script/1/updatePlug?sender=OtherPlug&value=100&&circuitclosed=true&priority=1&startup=false
-// Each plug should update all plugs including itself, and this script should be the first so that script ID is consistent
+// Each plug should update all plugs including itself
+// This script should be the first script on each plug so that URL's script ID is consistent
 // TODO: All updates should wait 1 second for inrush current to stabilize, especially for large transformers (like in cheap microwaves)
 // TODO: Sending updates every 10 seconds as a heartbeat, so that offline plugs can be pruned from list
 // TODO: Send updates to other plugs from this script, instead of via Shelly webhooks
@@ -404,7 +416,7 @@ export function processVoteRequest(request, response, userdata) {
 var voteHandlerURL = HTTPServer.registerEndpoint("voteRequest", processVoteRequest);
 console.log("Registered vote request handler at", voteHandlerURL);
 
-// TODO: Espruino 2v13 and earlier treats "let" as "var"; verify version and adjust this script accordingly
+// TODO: Espruino 2v13 and earlier treats "let" as "var"; verify version/behavior and adjust this script accordingly
 let testVariable = "outside";
 if (true) {
     let testVariable = "inside";
