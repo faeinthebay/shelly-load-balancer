@@ -112,9 +112,9 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             // TODO: include credentials here
             let response = Shelly.call("HTTP", {url: buildPlugURL(this.plugName, "relay/0?turn="+desiredStatus), timeout: 2});
             // TODO: Check response and retry if error, see https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/Switch/#http-endpoint-relayid
+            // TODO: Verify status was updated within a few seconds, aborting verification if switch is quickly toggled a second time to the original state
         },
         updatePriority (newPriority) {
-            // Does not update timeLastCrossedThreshold because watts are used for that, and validation/sanity check will catch issues
             if (newPriority == this.powerPriority){
                 return;
             }
@@ -123,7 +123,8 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             plugDevicesByPriority[newPriority].push(this.plugName);
             let targetIndex = plugDevicesByPriority[this.oldPriority].findIndex((testPlug) => testPlug.plugName == this.plugName)
             plugDevicesByPriority[oldPriority].splice(targetIndex);
-            // Assumes sort will be called right after this
+
+            updatePlugsByOnTime(); // Sort this plug into the new priority list
         },
         /*  Averages power consumption, weighted with exponential decay by minutes, perhaps 1/(2^(x+1)).  
             Total with a Riemann sum (rectangles to the right of the decreasing weight curve).
@@ -153,6 +154,8 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                 this.highestConsumption = this.greaterConsumption;
             }
             this.isCircuitClosed = newCircuitStatus;
+            // TODO: Sanity check that consumption is very low when turned off
+            // TODO: Reset recent history since the average will be weird
         }
     };
     plugDevicesByName.set(plugName, newPlug);
@@ -282,7 +285,7 @@ export function verifyCircuitLoad() {
     console.log("DEBUG: Finished checking circuit load");
 }
 
-function decodeParam(params, paramName, type){
+function decodeParam(params, paramName, type, minValue, maxValue){
     // Get starting and ending character of parameter's value
     let startIndex = params.indexOf(paramName + "=") + paramName.length + 1;
     if(startIndex == -1){
@@ -295,74 +298,72 @@ function decodeParam(params, paramName, type){
         var textValue = params.substring(startIndex);
     }
     
+    // Parse the parameter
     if (type == "number") {
-        return Number(textValue);
+        let parsedValue = Number(textValue);
+        if (parsedValue === NaN || 
+            // Actual number parsed, validate range if needed
+            ((minValue == null || parsedValue >= minValue) && 
+                (maxValue == null || parsedValue <= maxValue))){
+            return parsedValue;
+        } else {
+            throw new Error("Error parsing integer", textValue, "for parameter", paramName, "with minimum", minValue, "and maximum", maxValue);
+        }
     } else if (type == "string") {
         return textValue;
     } else if (type == "boolean") {
-        if(textValue.length === 0){
-            return null;
-        }
-        if(!(textValue === "true" || textValue === "false")){
-            throw new Error("Could not parse boolean");
+        if(textValue.length === 0 || !(textValue === "true" || textValue === "false")){
+            throw new Error("Could not parse boolean", textValue, "for parameter", paramName);
         }
         return textValue === "true";
     } else {
-        throw new Error("Invalid type to parse");
+        throw new Error("Cannot parse type", type, "for name", paramName);
     }
 }
 
-export function updatePlug(request, response, userdata) {
+export function updatePlug(request, response, _userdata) {
     // Decode request parameters
     let params = request.query;
     let receivedTime = new Date(); // Use internal clock for everything to avoid syncing clocks between devices
     console.log("DEBUG: Processing plug update request", params, "at time", receivedTime);
-    // TODO: Gracefully handle errors thrown by parser
     try {
-        let senderName = decodeParam(params, "sender", "string");
-        let newPowerValue = decodeParam(params, "value", "number");
-        let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean");
-        let senderPriority = decodeParam(params, "priority", "number");
+        let senderName = decodeParam(params, "sender", "string", null, null);
+        let newPowerValue = decodeParam(params, "value", "number", 0, null);
+        let newCircuitStatus = decodeParam(params, "circuitclosed", "boolean", null, null);
+        let senderPriority = decodeParam(params, "priority", "number", 0, minPriority);
         console.log("DEBUG: Params are", senderName, newPowerValue, newCircuitStatus, senderPriority);
 
         // Process parameters, responding with "bad request" if params are not as expected
         response.code = 200;
         if (senderName == null) {
+            // Can't parse report that has no plug name
             response.code = 400;
-        }
-
-        if (!plugDevicesByName.has(senderName)){
+        } else if (!plugDevicesByName.has(senderName)){
+            // New plug
             createPlug(senderName, receivedTime, newPowerValue, senderPriority, newCircuitValue, false);
         } else {
+            // Update existing plug with provided parameters
             let senderObj = plugDevicesByName.get(senderName);
         
             if(newCircuitStatus !== null){ // Update circuit status and greatest consumption history, before it is updated with off-values
                 senderObj.updateCircuitClosed(newCircuitStatus);
             }
             if(newPowerValue !== null && !isNaN(newPowerValue)){
-                if(!(0 < newPowerValue)){
-                    response.code = 400;
-                }else{
-                    senderObj.updatePower(receivedTime, newPowerValue);
-                }
+                senderObj.updatePower(receivedTime, newPowerValue);
             }
             if(senderPriority !== null && !isNaN(senderPriority)){
-                if(!(0 < senderPriority && senderPriority < minPriority)){
-                    response.code = 400;
-                }else{
-                    senderObj.updatePriority(senderPriority);
-                }
+                senderObj.updatePriority(senderPriority);
             }
         }
     } catch (error) {
-        console.log("ERROR: Parsing request", params, "failed with error message", error)
+        console.log("ERROR: While parsing request", params, "got error message", error)
         response.code = 400;
     }
 
     if (!response.send()){
         console.log("Failed to send response for request", params, "with status", response.code);
     }else{
-        console.log("DEBUG: Sent response for request", params, "with status", response.code);
+        console.log("DEBUG: Finished sending response for request", params, "with status", response.code);
     }
 
     if(isLeader){
@@ -385,7 +386,7 @@ var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
 console.log("DEBUG: Registered internal status listener");
 
 var updateHandlerURL = HTTPServer.registerEndpoint("updatePlug", updatePlug);
-console.log("Registered plug update handler at", updateHandlerURL);
+console.log("DEBUG: Registered plug update handler at", updateHandlerURL);
 // Full URL will look like: http://Shelly-Plug.local/script/1/updatePlug?sender=OtherPlug&value=100&&circuitclosed=true&priority=1&startup=false
 // Each plug should update all plugs including itself
 // This script should be the first script on each plug so that URL's script ID is consistent
