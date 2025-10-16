@@ -4,6 +4,10 @@
     preventing the circuit from being overloaded by deprioritizing low-priority plugs.
     Caution: High-current loads through consumer-grade smart plugs can damage them over time!
              It happened to me with a 12-amp 120-volt load with minimal cyclings!
+    Notes:
+    - All "print" statements are console.log(), regardless of log level, due to Espruino limitations
+    - Espruino has no threading, and interrupts will wait for the previous interrupt to finish, 
+      so no thread safety is needed
 */
 export const name = "shellyloadbalancer"; // Make available as ES module, for testing with Jest
 console.log("Starting power load balancer script");
@@ -16,6 +20,7 @@ const significantWattsThreshold = 200; // Below the minimum power of a small, 50
 const standbyWattsThreshold = 5;
 const significantWattChange = 5; // Watts difference that is ignored
 const minutesPowerHistory = 5;
+const msWaitForInrushStabilization = 1000; // Can take up to 1 second for large inductive loads, like transformers, to stabilize
 const ownPriority = 5; // See line 68 (TODO) for priorities
 // User needs to include this plug's name in the following list of plug names
 const knownPlugNames = ["misha-air-conditioner", "katherine-air-conditioner", "evse", "living-room-air-conditioner"] // Declared in script instead of KVS to avoid character limit
@@ -33,6 +38,8 @@ const commonPassword = "Sysssadm1n!"; // Plugs will be behind firewall, so this 
 
 var needToUpdateOtherPlugs = false;
 var isLeader = true;
+var expectedInrushUpdateTime = new Date();
+var inrushTimeoutID = null;
 
 function exceedsThreshold(compareValue) {
     return compareValue > significantWattsThreshold;
@@ -77,7 +84,12 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
             return exceedsThreshold(averageRecentConsumption);
         },
         updatePower (time, newPower) {
-            if(Math.abs(newPower - this.powerConsumption[this.timeLastUpdated]) < 5){
+            if(Math.abs(newPower - this.powerConsumption[this.timeLastUpdated]) < significantWattChange){
+                return;
+            }
+            if(time <= this.timeLastUpdated){
+                // If requests are processed out of order somehow, ignore older updates
+                console.log("WARNING: Somehow a power update for plug", this.plugName, "was received at", time, "after an update was already received at", time.timeLastUpdated);
                 return;
             }
             if(exceedsThreshold(newPower) != this.currentlyExceedsThreshold()){
@@ -154,8 +166,12 @@ export function createPlug(plugName, timeLastSeen, presentPowerConsumption, powe
                 this.highestConsumption = this.greaterConsumption;
             }
             this.isCircuitClosed = newCircuitStatus;
-            // TODO: Sanity check that consumption is very low when turned off
-            // TODO: Reset recent history since the average will be weird
+            // Reset recent history since the average would otherwise be difficult to use
+            // New power value must be immediately added or exceptions may occur from invalid values
+            this.powerConsumption = new Map();
+            this.timeLastUpdated = null;
+            this.greaterConsumption = NaN;
+            this.highestConsumption = NaN; // Reset highest consumption record with every circuit cycle
         }
     };
     plugDevicesByName.set(plugName, newPlug);
@@ -371,17 +387,41 @@ export function updatePlug(request, response, _userdata) {
     }
 }
 
-// Called by host runtime when there is a status update
+// Called by host runtime when there is a status update for this plug
 function statusUpdateHandler(status){
     if(status.component !== "switch:0"){ // TODO: Verify this is the correct status format
+        console.log("DEBUG: Ignoring status update because it was for", status.component)
         return;
     }
-    // Verify th
-    selfPlug.isCircuitClosed = status.output;
-    // TODO: Wait for 1 second
-    selfPlug.updatePower(new Date(), status.apower);
-    // Need to send updates in a timely fashion, so block and send (as there is no parallel execution)
+    let receivedTime = new Date();
+    selfPlug.updateCircuitClosed(status.output);
+
+    // Power has just begun increasing so we need to wait for inrush to settle
+    if(status.apower > selfPlug.powerConsumption[selfPlug.timeLastUpdated] && expectedInrushUpdateTime === null){
+        expectedInrushUpdateTime = new Date(receivedTime.getTime() + msWaitForInrushStabilization);
+        console.log("DEBUG: Waiting out inrush until", expectedInrushUpdateTime);
+        setTimeout(function(){
+            console.log("DEBUG: Inrush imeout triggered at", new Date());
+            this(Shelly.getComponentStatus("switch", 0));
+        }, msWaitForInrushStabilization);
+    }
+    // Power is decreasing, or done waiting for inrush, so update can be triggered
+    else if(status.apower <= selfPlug.powerConsumption[selfPlug.timeLastUpdated] || receivedTime >= expectedInrushUpdateTime){
+        console.log("DEBUG: Updating power at", receivedTime);
+        selfPlug.updatePower(new Date(), status.apower);
+        clearTimeout(inrushTimeoutID);
+        expectedInrushUpdateTime = null;
+        inrushTimeoutID = null;
+    }
+    // Still waiting for inrush to stabilize; ignore this update
+    else {
+        console.log("DEBUG: Ignoring power update at", receivedTime);
+        return;
+    }
+    
+    // TODO: Need to send updates in a timely fashion, so block and send (as there is no parallel execution)
 }
+
 var statusListener = Shelly.addStatusHandler(statusUpdateHandler);
 console.log("DEBUG: Registered internal status listener");
 
