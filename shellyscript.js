@@ -437,21 +437,179 @@ console.log("DEBUG: Registered plug update handler at", updateHandlerURL);
 // TODO: When hello is received, reset plug statistics and resend own statistics.  
 // TODO: Periodically check needToUpdateOtherPlugs.  For self, replace domain with 127.0.0.1.  
 // TODO: If plug cannot communicate, open its circuit
+// TODO: Instead of electing new leader by uptime, select by best connection strength in https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/WiFi/#wifilistapclients
+// TODO: If device has receives vote echo but no vote initiate within a few seconds, send hello since it wasn't seen.
 
+export function createVote(uuid, sender, isOriginator, type, subject, data){
+    let vote = {
+        UUID: uuid, 
+        initator: sender, 
+        stage: isOriginator ? 0 : 1,
+        type: type, 
+        subject: subject,
+        data: data, // Map of additional params, such as "parent" vote that this applies to
+        retries: 0,
+        devicesExpected: [], // Devices which *should* be participating in this vote
+        devicesAcknowledgedForStage: [],
+        errrorsByDevice: new Map(),
+        responseByDevice: new Map(), // NaN signifies invalid request to this device
+        beginStage() {
+            switch (this.stage) {
+                case 0: 
+                    // This device has started a vote.  Notify other devices.
+                    this.sendToAllDevices();
+                    break;
+                case 1:
+                    // If this device is not the initiator, it needs to send an echo of the vote
+                    if (selfPlug.name != this.initator){
+                        this.sendToAllDevices();
+                    }
+                    break;
+                case 2: 
+                    // Send vote
+                    let voteResponse = decideVoteResponse();
+                    // TODO: transform voteResponse into URL params
+                    //this.sendToAllDevices();
+                    // TODO
+                    break;
+                case 3: 
+                    // Send tally
+                    // TODO
+                    break;
+                case 4: 
+                    // Send tally comparison
+                    // TODO
+                    break;
+                case 5: 
+                    // All agrees received.  This vote has ended.  Update data structures with vote.  
+                    // TODO
+                    break;
+            }
+            // TODO: Set timeout for this vote step
+        },
+        finishStage() {
+            switch (this.stage) {
+                case 0: 
+                    // Done sending out vote requests
+                    break;
+                case 1:
+                    // This device has sent an echo and recorded all echoes.  
+                    // If other devices sent echo with additional participating devices, request a hello from it.  
+                    // TODO
+                    break;
+                case 2: 
+                    // This device has received all votes.
+                    break;
+                case 3: 
+                    // All tallies received.  
+                    // TODO
+                    break;
+                case 4: 
+                    // All tally-comparisons received.  Send agree or retry.  
+                    // TODO
+                    break;
+                case 5: 
+                    // All agrees received.  This vote has ended.  Update data structures with vote.  
+                    break;
+            }
+            this.devicesAcknowledgedForStage = [];
+            stage++;
+            // TODO: Unset timeout
+        }, 
+        processRequest() {
+            // TODO same kind of switch statement, but mostly processing echoes and responses
+
+            //Stage 1: If other devices sent echo with additional participating devices, request a hello from it.  
+        },
+        allDevicesResponded() {
+            for (const checkDevice in this.devicesExpected){
+                if(!(this.devicesRespondedForStage.includes(checkDevice))){
+                    return false;
+                }
+            }
+            return true;
+        },
+        sendToAllDevices(extraParams = ""){
+            let URLstring = "voterequest?uuid=" + this.uuid + "&sender=" + selfPlug.name + "&stage=" + this.stage + "&type=" + this.type + "&subject=" + this.subject + extraParams;
+            for(const receipientDevice in this.devicesExpected){
+                let response = Shelly.call("HTTP", {url: buildPlugURL(receipientDevice, URLstring), timeout: 2}, this.processResponse, receipientDevice);
+            }
+        },
+        encounteredVoteStepTimeout(){
+            // This timeout was encountered before all devices responded.  Drop device from vote.  
+        },
+        // Log devices that 
+        processResponse(result, error_code, error_message, userdata){
+            if(error_code === 0){
+                this.devicesAcknowledgedForStage.push(userdata);
+            }else{
+                let errorCount = this.errrorsByDevice.get(userdata);
+                if (errorCount === undefined){
+                    errorCount = 1;
+                }else{
+                    errorCount++;
+                }
+                this.errrorsByDevice.set(userdata, errorCount);
+            }
+        },
+        decideVoteResponse(){
+            switch(this.type){
+                case 0: // Elect leader with greatest uptime
+                    // Iterate through all plugs in this vote and select device with the greatest uptime
+                    // Return device name
+                case 1: // Decide if vote subject should be considered offline (hasn't responded in time)
+                    // Return true or false
+            }
+        }
+    };
+    // Populate list of expected voting devices, except for voting subject (who is likely offline, but will be pinged anyway)
+    let expectedDevices = Array.from(plugDevicesByName.keys());
+    vote.devicesExpected = expectedDevices.splice(expectedDevices.indexOf(subject));
+    vote.remainingResponses = vote.devicesExpected.length;
+    return vote;
+}
 
 /*  TODO: Make a system where plugs will decide which becomes the leader by longest time online.
     A leader plug that has been offline for 25 seconds (two check-in periods) is "voted out".
     Any plug can send a "voting motion" with a uniqute voting UID to the other plugs, 
     which triggers all to evalute the voting scenario. Each plug sends its vote to all the others, 
     then all plugs tally the votes and send their tally to the others.  If any plug detects a tally mismatch, 
-    it sends a mismatch signal to the others, which rebroadcast it.  Then the vote is redone, 
-    with a decreasing retry count until a fallback scenario is reached.  
-
+    it sends a mismatch signal to the others, which rebroadcast it.  Then a sub-vote is done to see if everyone agrees
+    on the majority winner.  If no majority winner, use vote UID as random number seed 
+    and pick which device's vote is the winner (plugs sorted in alpha order).
 */
 export function processVoteRequest(request, response, userdata) {
     let params = request.query;
     let receivedTime = new Date();
     console.log("DEBUG: Processing vote request", params, "at time", receivedTime);
+    /* Possible vote stages and JSON contents are:
+    0. Init vote (contains vote type, specific request if any, recipients, and original sender)
+    1. Echo vote init/retry (repeats init contents).  Only used to populate list of other voting members
+    2. Cast vote (contains init contents and specific vote)
+    3. Vote tally (contains init contents and tallies of each vote type)
+    4. Tally comparison (contains init contents and agree/disagree)
+    5. Vote accepted
+    */
+    /* Vote metadata:
+    - Vote UUID (Math.randInt(99999))
+    - Sender name
+    - Vote stage
+    - Vote type
+    - Specific vote subject
+    - Data
+    */
+    /* Vote types:
+    0. Elect leader (has not been seen for timeout-10 seconds, so nominate next device)
+    1. Remove device (has not been seen for timeout-10 seconds)
+    */
+    /* For example:
+    - UID: 12345
+    - Sender: Misha-AC
+    - Stage: 3 (vote tally)
+    - Type: 0 (elect leader)
+    - Subject: Kathryn-AC
+    - Data: 3 votes for Misha-AC (no others)
+    */
     // TODO
 }
 var voteHandlerURL = HTTPServer.registerEndpoint("voteRequest", processVoteRequest);
@@ -462,4 +620,8 @@ let testVariable = "outside";
 if (true) {
     let testVariable = "inside";
 }
-console.log("DEBUG: using keyword let will presist", testVariable);
+console.log("DEBUG: using keyword \'let\' will presist", testVariable);
+function printParamTest(param = "default"){
+    console.log("DEBUG: A function with empty param will print", param)
+}
+printParamTest();
